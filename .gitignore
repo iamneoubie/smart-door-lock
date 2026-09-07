@@ -1,0 +1,12 @@
+# select to ignore
+
+# root folder not needed in path
+# /file.extension
+# /folder/file.extension
+
+# To select all files
+# *.extension
+# folder/another_folder/*
+
+/logs/
+.vscode
