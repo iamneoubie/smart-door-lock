@@ -3,45 +3,65 @@
 
 Servo myServo;
 
-// Servo positions
-const int OPEN_POS = 0;    // Open position (0 degrees)
-const int CLOSE_POS = 180; // Close position (180 degrees)
+// ============================================================
+// SERVO PIN
+// ============================================================
+#define SERVO_PIN 2 // Signal pin to GPIO2
 
+// ============================================================
+// SERVO POSITIONS
+// Matches Smart Lock v1.17 convention:
+//   0°   = LOCKED / CLOSED
+//   180° = UNLOCKED / OPEN
+// ============================================================
+const int LOCK_POS = 120; // Locked (closed) position
+const int UNLOCK_POS = 0; // Unlocked (open) position
+
+// ============================================================
+// SETUP
+// ============================================================
 void setup()
 {
     Serial.begin(115200);
-    myServo.attach(2); // Signal pin to GPIO2
+    myServo.attach(SERVO_PIN);
 
     Serial.println("ESP32 Servo Ready!");
 
-    // Start with servo at close position
-    myServo.write(CLOSE_POS);
+    // Start with servo at LOCKED position
+    myServo.write(LOCK_POS);
     delay(1000);
 }
 
+// ============================================================
+// LOOP
+// ============================================================
 void loop()
 {
-    // Open
-    Serial.println("Opening...");
-    openBuzzer();
+    // Unlock / Open
+    Serial.println("Opening (UNLOCK)...");
+    openDoor();
     delay(2000);
 
-    // Close
-    Serial.println("Closing...");
-    closeBuzzer();
+    // Lock / Close
+    Serial.println("Closing (LOCK)...");
+    closeDoor();
     delay(2000);
 }
 
-// Function to open the buzzer
-void openBuzzer()
+// ============================================================
+// SERVO FUNCTIONS
+// ============================================================
+
+// Move servo to UNLOCKED (open) position
+void openDoor()
 {
-    myServo.write(OPEN_POS);
+    myServo.write(UNLOCK_POS);
     delay(500); // Allow time for servo to reach position
 }
 
-// Function to close the buzzer
-void closeBuzzer()
+// Move servo to LOCKED (closed) position
+void closeDoor()
 {
-    myServo.write(CLOSE_POS);
+    myServo.write(LOCK_POS);
     delay(500); // Allow time for servo to reach position
 }

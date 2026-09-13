@@ -1,13 +1,35 @@
 #include <Arduino.h>
 #line 1 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 /*
- * ESP32 Smart Lock System - VERSION 1.17
+ * ESP32 Smart Lock System - VERSION 1.27
  * ============================================
- * Changes from v1.16:
- * - Removed PIN attempt counter and lockout
- * - Invalid PIN now simply resets to main screen
- * - Cleaner, more predictable PIN handling
- * - No servo movement on any PIN failure path
+ * Changes from v1.26:
+ * - FIXED servo twitch when buzzer fires while rejecting a command.
+ *   Root cause: ledcWriteTone() for the buzzer was colliding with
+ *   ESP32Servo's LEDC timer allocation, hijacking the servo PWM
+ *   frequency and causing the servo to drift toward a random
+ *   position (usually 0/unlocked) whenever buzzerError() ran.
+ *
+ *   Fix:
+ *     1. Explicitly allocate LEDC timers 0+1 for the servo via
+ *        ESP32PWM::allocateTimer().
+ *     2. Attach the buzzer to a fixed, high LEDC channel (7) that
+ *        does not overlap the servo timers.
+ *     3. Re-assert myServo.write(currentServoPos) after every
+ *        buzzer routine as a belt-and-suspenders guard.
+ *
+ * - CONSOLIDATED validators. Removed triple-redundant state checks.
+ *   State gating now lives in ONE place: preValidateAction(),
+ *   called from requestLockAction()/requestUnlockAction().
+ *   The keypad layer no longer pre-checks isLocked; it just routes
+ *   the user into PIN entry, and the central gate decides.
+ *
+ * - Keypad UX preserved: pressing A while locked still shows
+ *   "ALREADY LOCKED" immediately (feedback comes from the central
+ *   gate, not a duplicate check).
+ *
+ * Kept: two-layer validation, reset reason logging, modular structure,
+ * configurable timings, BT/serial/keypad parity.
  */
 
 #include "BluetoothSerial.h"
@@ -15,15 +37,13 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <ESP32Servo.h>
-#include <SPI.h>
-#include <MFRC522.h>
 #include <DHT.h>
+#include <esp_system.h>
 
 // ============================================================
 // PIN CONFIGURATION
 // ============================================================
 
-// Keypad - 4x4 Matrix
 const byte ROWS = 4;
 const byte COLS = 4;
 char keys[ROWS][COLS] = {
@@ -35,57 +55,57 @@ byte rowPins[ROWS] = {13, 12, 14, 27};
 byte colPins[COLS] = {26, 25, 33, 32};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-// LCD - I2C
 #define LCD_ADDRESS 0x27
 #define LCD_COLUMNS 16
 #define LCD_ROWS 2
 LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
 
-// RFID - RC522
-#define SS_PIN 5
-#define RST_PIN 4
-MFRC522 mfrc522(SS_PIN, RST_PIN);
-
-// DHT11
 #define DHT_PIN 17
 #define DHT_TYPE DHT11
 DHT dht(DHT_PIN, DHT_TYPE);
 
-// Servo
 #define SERVO_PIN 2
 Servo myServo;
 
-// Buzzer
 #define BUZZER_PIN 16
 #define BUZZER_FREQ 1500
+#define BUZZER_LEDC_CHANNEL 7 // explicit, non-overlapping with servo timers
+#define BUZZER_LEDC_RES 8
 
-// Bluetooth
 BluetoothSerial SerialBT;
 
 // ============================================================
 // SYSTEM CONSTANTS
 // ============================================================
 
-// Security
 const char *BLUETOOTH_NAME = "Smart Lock";
 const String BACKDOOR_KEY = "54321";
+const int PIN_LENGTH = 5;
 
-// Servo Positions
-const int SERVO_LOCK_POS = 0;
-const int SERVO_UNLOCK_POS = 180;
-const int SERVO_SPEED_DELAY = 12;
+const bool MASK_PIN_ON_LCD = false;
+
+const int SERVO_LOCK_POS = 120;
+const int SERVO_UNLOCK_POS = 0;
 const int SERVO_POSITION_TOLERANCE = 3;
 
-// Timing Constants
+// ============================================================
+// USER-CONFIGURABLE TIMINGS
+// ============================================================
+
 const unsigned long DEBOUNCE_DELAY = 80;
 const unsigned long LCD_UPDATE_INTERVAL = 200;
+
 const unsigned long SCREEN_TIMEOUT = 30000;
 const unsigned long PIN_TIMEOUT = 10000;
-const unsigned long AUTO_LOCK_DELAY = 20000;
-const unsigned long RFID_COOLDOWN = 300;
-const unsigned long DISPLAY_DURATION = 10000;
+
+const unsigned long AUTO_LOCK_DELAY = 10000;
+const unsigned long AUTO_LOCK_GRACE = 3000;
+
+const unsigned long DISPLAY_DURATION = 3000;
+
 const unsigned long DHT_READ_INTERVAL = 2000;
 const unsigned long BT_FEEDBACK_DELAY = 300;
+const unsigned long SERVO_SETTLE_DELAY = 1000;
 
 // ============================================================
 // SYSTEM STATE
@@ -98,26 +118,22 @@ unsigned long systemStartTime = 0;
 unsigned long lastActivityTime = 0;
 unsigned long lastKeyPressTime = 0;
 unsigned long lastLCDUpdateTime = 0;
-unsigned long rfidCooldown = 0;
 unsigned long unlockStartTime = 0;
-bool autoLockPending = false;
 unsigned long lastDHTReadTime = 0;
 bool keypadOperationInProgress = false;
-bool rfidInitialized = false;
 
-// LCD Buffer
+int currentServoPos = SERVO_LOCK_POS;
+
 String lcdRow0 = "";
 String lcdRow1 = "";
 bool lcdNeedsUpdate = true;
 
-// Keypad State
 String pinBuffer = "";
 String pendingAction = "";
 bool isPinMode = false;
 unsigned long pinStartTime = 0;
 bool pinTimeoutTriggered = false;
 
-// Display Modes
 enum DisplayMode
 {
     DISPLAY_MAIN,
@@ -127,90 +143,102 @@ enum DisplayMode
 DisplayMode currentDisplayMode = DISPLAY_MAIN;
 unsigned long displayStartTime = 0;
 
-// DHT11 data
 float lastTemperature = 0;
 float lastHumidity = 0;
 bool hasDHTData = false;
 
+unsigned long lastUserActivity = 0;
+bool autoLockArmed = false;
+
 // ============================================================
-// HELPER FUNCTIONS
+// FORWARD DECLARATIONS
 // ============================================================
 
-#line 137 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-String getTimestamp();
-#line 150 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void logMsg(String msg);
-#line 159 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void setLCD(int row, const String &text);
-#line 185 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void updateLCD();
-#line 200 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void showMainScreen();
-#line 209 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void showPinEntry();
-#line 219 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void showActionMessage(String msg);
-#line 233 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void showTemperature();
-#line 280 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void showBluetoothInfo();
-#line 300 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void updateActivity();
-#line 310 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void manageLCD();
-#line 342 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void buzzerInit();
-#line 355 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void buzzerSuccess();
-#line 362 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void buzzerError();
-#line 371 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void buzzerClick();
-#line 381 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-String getDoorStatus();
-#line 386 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-int getExpectedServoPosition();
-#line 391 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-bool isServoAtExpectedPosition();
-#line 402 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void reportDoorStatus(const String &source);
-#line 418 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void servoInit();
-#line 428 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void moveServo(int target);
-#line 559 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void lockDoor();
-#line 564 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void unlockDoor();
-#line 570 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void sendResponse(String msg);
-#line 580 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-bool validatePIN(String pin);
-#line 602 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void resetPinMode();
-#line 618 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void showMainScreen();
+void showMessage(String msg1, String msg2);
+void armAutoLock();
+void disarmAutoLock();
+void handleServoAction(String action, String pin, String source);
+void requestLockAction(String pin, String source);
+void requestUnlockAction(String pin, String source);
+bool preValidateAction(const String &action, const String &source);
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+#line 169 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+String getTimestamp();
+#line 182 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void logMsg(String msg);
+#line 191 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void setLCD(int row, const String &text);
+#line 217 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void updateLCD();
+#line 241 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void showPinEntry();
+#line 262 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void showActionMessage(String msg);
+#line 276 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void showTemperature();
+#line 323 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void showBluetoothInfo();
+#line 343 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void updateActivity();
+#line 357 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void manageLCD();
+#line 395 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void buzzerInit();
+#line 401 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void buzzerBeep(int duration, int freq);
+#line 410 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void servoReassert();
+#line 415 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void buzzerSuccess();
+#line 423 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void buzzerError();
+#line 433 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void buzzerClick();
+#line 443 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+String getDoorStatus();
+#line 448 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+int getExpectedServoPosition();
+#line 453 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+bool isServoAtExpectedPosition();
+#line 458 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void reportDoorStatus(const String &source);
+#line 477 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void servoInit();
+#line 497 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void moveServo(int target);
+#line 508 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void sendResponse(String msg);
+#line 518 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+bool validatePIN(String pin);
+#line 730 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void processKeypad(char key);
-#line 792 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void processRFID();
-#line 852 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 872 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param);
-#line 884 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-bool isValidBTCommand(String cmd);
-#line 914 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 904 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+bool parseBTCommand(String cmd, String &action, String &pin);
+#line 947 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void processBT(String cmd);
-#line 1007 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 1035 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void checkAutoLock();
-#line 1032 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 1083 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 bool initDHT();
-#line 1060 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 1111 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void updateDHTData();
-#line 1081 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 1132 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void processSerialCommands();
-#line 1153 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 1235 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void logResetReason();
+#line 1282 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void setup();
-#line 1242 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 1347 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void loop();
-#line 137 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 169 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 String getTimestamp()
 {
     unsigned long elapsed = millis() - systemStartTime;
@@ -230,7 +258,7 @@ void logMsg(String msg)
 }
 
 // ============================================================
-// LCD FUNCTIONS
+// LCD
 // ============================================================
 
 void setLCD(int row, const String &text)
@@ -286,7 +314,18 @@ void showMainScreen()
 void showPinEntry()
 {
     setLCD(0, "ENTER PIN");
-    String display = pinBuffer;
+
+    String display = "";
+    if (MASK_PIN_ON_LCD)
+    {
+        for (unsigned int i = 0; i < pinBuffer.length(); i++)
+            display += "*";
+    }
+    else
+    {
+        display = pinBuffer;
+    }
+
     while (display.length() < 16)
         display += " ";
     setLCD(1, display);
@@ -300,7 +339,7 @@ void showActionMessage(String msg)
     updateLCD();
 }
 
-void showMessage(String msg1, String msg2 = "")
+void showMessage(String msg1, String msg2)
 {
     setLCD(0, msg1);
     setLCD(1, msg2);
@@ -377,6 +416,10 @@ void showBluetoothInfo()
 void updateActivity()
 {
     lastActivityTime = millis();
+
+    if (autoLockArmed && !isLocked)
+        lastUserActivity = millis();
+
     if (!lcd.getBacklight())
     {
         lcd.backlight();
@@ -413,20 +456,33 @@ void manageLCD()
 }
 
 // ============================================================
-// BUZZER FUNCTIONS
+// BUZZER  (fixed: dedicated LEDC channel, servo re-assertion)
+// ------------------------------------------------------------
+// ESP32Servo uses LEDC timers. ledcWriteTone() on a channel that
+// shares a timer with the servo will change that timer's frequency,
+// corrupting the servo pulse train and causing a twitch. We attach
+// the buzzer to channel 7 explicitly, and after every buzzer
+// routine we re-assert the servo position as a safety net.
 // ============================================================
 
 void buzzerInit()
 {
-    ledcAttach(BUZZER_PIN, BUZZER_FREQ, 8);
+    ledcAttachChannel(BUZZER_PIN, BUZZER_FREQ, BUZZER_LEDC_RES, BUZZER_LEDC_CHANNEL);
     delay(50);
 }
 
-void buzzerBeep(int duration = 150, int freq = 1500)
+void buzzerBeep(int duration, int freq)
 {
     ledcWriteTone(BUZZER_PIN, freq);
     delay(duration);
     ledcWrite(BUZZER_PIN, 0);
+}
+
+// Re-assert servo after any tone burst so any residual PWM
+// disturbance is immediately corrected.
+void servoReassert()
+{
+    myServo.write(currentServoPos);
 }
 
 void buzzerSuccess()
@@ -434,6 +490,7 @@ void buzzerSuccess()
     buzzerBeep(100, 2000);
     delay(60);
     buzzerBeep(100, 2500);
+    servoReassert();
 }
 
 void buzzerError()
@@ -443,18 +500,19 @@ void buzzerError()
         buzzerBeep(100, 800);
         delay(60);
     }
+    servoReassert();
 }
 
 void buzzerClick()
 {
     buzzerBeep(30, 1500);
+    servoReassert();
 }
 
 // ============================================================
-// DOOR STATUS - READ ONLY
+// DOOR STATUS
 // ============================================================
-// IMPORTANT: These functions NEVER call servo.write(), attach(), or moveServo().
-// Status/reporting must never cause physical servo movement.
+
 String getDoorStatus()
 {
     return isLocked ? "LOCKED" : "UNLOCKED";
@@ -467,183 +525,59 @@ int getExpectedServoPosition()
 
 bool isServoAtExpectedPosition()
 {
-    int position = myServo.read();
-    int expected = getExpectedServoPosition();
-
-    if (position < 0)
-        return false;
-
-    return abs(position - expected) <= SERVO_POSITION_TOLERANCE;
+    return abs(currentServoPos - getExpectedServoPosition()) <= SERVO_POSITION_TOLERANCE;
 }
 
 void reportDoorStatus(const String &source)
 {
     String status = getDoorStatus();
-    int servoPosition = myServo.read();
     bool positionOK = isServoAtExpectedPosition();
 
     logMsg(source + ": Status - " + status +
-           ", servo position = " + String(servoPosition) +
+           ", servo position = " + String(currentServoPos) +
            ", expected = " + String(getExpectedServoPosition()) +
            ", position check = " + (positionOK ? "OK" : "MISMATCH"));
 }
 
 // ============================================================
-// SERVO FUNCTIONS - CENTRALIZED STATE MANAGEMENT
+// SERVO
+// ------------------------------------------------------------
+// Servo stays attached. Explicitly reserve LEDC timers 0 and 1
+// for ESP32Servo so the buzzer (channel 7, higher timer) cannot
+// collide with it.
 // ============================================================
 
 void servoInit()
 {
-    myServo.attach(SERVO_PIN);
+    logMsg("SERVO: Allocating LEDC timers 0,1 for servo");
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+
+    logMsg("SERVO: Attaching to pin " + String(SERVO_PIN));
+    myServo.setPeriodHertz(50);
+    myServo.attach(SERVO_PIN, 500, 2400); // 500us..2400us pulse range
     delay(200);
+
+    logMsg("SERVO: Writing LOCK position (" + String(SERVO_LOCK_POS) + ")");
     myServo.write(SERVO_LOCK_POS);
-    delay(500);
+    currentServoPos = SERVO_LOCK_POS;
+    delay(SERVO_SETTLE_DELAY);
+
     isLocked = true;
-    logMsg("Servo initialized at LOCK position");
+    logMsg("SERVO: Ready at LOCK position");
 }
 
 void moveServo(int target)
 {
-    int current = myServo.read();
+    logMsg("SERVO: Moving " + String(currentServoPos) + " -> " + String(target));
 
-    // Never issue a write if the commanded position is already reached.
-    if (current < 0)
-        current = target;
+    myServo.write(target);
+    currentServoPos = target;
+    delay(SERVO_SETTLE_DELAY);
 
-    if (current == target)
-    {
-        logMsg("SERVO: Target already reached - no movement command");
-        return;
-    }
-
-    int step = (target > current) ? 1 : -1;
-    while (current != target)
-    {
-        current += step;
-        myServo.write(current);
-        delay(SERVO_SPEED_DELAY);
-        yield();
-    }
+    logMsg("SERVO: Settled at " + String(target));
 }
 
-// CENTRALIZED SERVO CONTROL FUNCTION
-// This handles ALL state checking and servo operations
-void handleServoAction(String action, String source = "KEYPAD")
-{
-    action.trim();
-    action.toUpperCase();
-
-    // This is the ONLY function allowed to command the servo.
-    // Status checks above are read-only and never move it.
-    logMsg("SERVO: Action requested - " + action + " from " + source +
-           " (Current state: " + getDoorStatus() + ")");
-
-    if (action == "LOCK")
-    {
-        if (isLocked)
-        {
-            // ============================================================
-            // COMPLETELY PASSIVE BRANCH - NO ELECTRICAL ACTIVITY
-            // ============================================================
-            logMsg("SERVO: Already LOCKED - no servo movement");
-            showMessage("ALREADY LOCKED", "");
-
-            if (source == "BLUETOOTH")
-                sendResponse("ERROR: Already locked");
-            else if (source == "SERIAL")
-                Serial.println("ERROR: Already locked");
-
-            // NO buzzerError() - completely silent electrically
-            // NO servo.write() - no movement commands
-            // NO other electrical activity
-
-            delay(800);
-            showMainScreen();
-            return;
-        }
-
-        logMsg("SERVO: Executing LOCK");
-        showActionMessage("LOCKING...");
-        moveServo(SERVO_LOCK_POS);
-
-        // State changes only AFTER the physical movement completes.
-        isLocked = true;
-        autoLockPending = false;
-
-        buzzerBeep(100, 1200);
-        delay(500);
-        showMainScreen();
-        logMsg("SERVO: Door locked successfully");
-
-        if (source == "BLUETOOTH")
-            sendResponse("SUCCESS: Locked");
-        else if (source == "SERIAL")
-            Serial.println("SUCCESS: Locked");
-
-        return;
-    }
-
-    if (action == "UNLOCK")
-    {
-        if (!isLocked)
-        {
-            // ============================================================
-            // COMPLETELY PASSIVE BRANCH - NO ELECTRICAL ACTIVITY
-            // ============================================================
-            logMsg("SERVO: Already UNLOCKED - no servo movement");
-            showMessage("ALREADY UNLOCKED", "");
-
-            if (source == "BLUETOOTH")
-                sendResponse("ERROR: Already unlocked");
-            else if (source == "SERIAL")
-                Serial.println("ERROR: Already unlocked");
-
-            // NO buzzerError() - completely silent electrically
-            // NO servo.write() - no movement commands
-            // NO other electrical activity
-
-            delay(800);
-            showMainScreen();
-            return;
-        }
-
-        logMsg("SERVO: Executing UNLOCK");
-        showActionMessage("UNLOCKING...");
-        moveServo(SERVO_UNLOCK_POS);
-
-        // State changes only AFTER the physical movement completes.
-        isLocked = false;
-        unlockStartTime = millis();
-        autoLockPending = true;
-
-        buzzerSuccess();
-        delay(500);
-        showMainScreen();
-        logMsg("SERVO: Door unlocked successfully");
-
-        if (source == "BLUETOOTH")
-            sendResponse("SUCCESS: Unlocked");
-        else if (source == "SERIAL")
-            Serial.println("SUCCESS: Unlocked");
-
-        return;
-    }
-
-    logMsg("SERVO: Unknown action - " + action);
-}
-
-// Legacy functions for compatibility - they now call the centralized function
-void lockDoor()
-{
-    handleServoAction("LOCK", "INTERNAL");
-}
-
-void unlockDoor()
-{
-    handleServoAction("UNLOCK", "INTERNAL");
-}
-
-// Helper to send response
 void sendResponse(String msg)
 {
     if (SerialBT.connected())
@@ -651,30 +585,199 @@ void sendResponse(String msg)
 }
 
 // ============================================================
-// PIN VALIDATION FUNCTIONS
+// PIN VALIDATION
 // ============================================================
 
 bool validatePIN(String pin)
 {
     pin.trim();
+
     if (pin.length() == 0)
         return false;
 
-    // Check if PIN matches BACKDOOR_KEY
+    if (pin.length() != PIN_LENGTH)
+        return false;
+
+    for (unsigned int i = 0; i < pin.length(); i++)
+    {
+        if (pin[i] < '0' || pin[i] > '9')
+            return false;
+    }
+
     if (pin == BACKDOOR_KEY)
         return true;
 
     return false;
 }
 
-void handleFailedPINAttempt(String source = "KEYPAD")
+// ============================================================
+// CENTRAL STATE GATE  (single source of truth)
+// ------------------------------------------------------------
+// This is the ONLY place that decides whether an action is
+// allowed given the current lock state. Both Layer 1
+// (requestLockAction/requestUnlockAction) and the keypad/BT/serial
+// callers rely on this. No duplicate isLocked checks elsewhere.
+// ============================================================
+
+bool preValidateAction(const String &action, const String &source)
 {
-    logMsg("PIN: Failed attempt from " + source);
-    showMessage("INVALID PIN", "");
-    buzzerError();
-    delay(1000);
-    resetPinMode(); // clears PIN mode and returns to main screen
+    String src = source;
+    src.trim();
+    src.toUpperCase();
+
+    if (action == "LOCK" && isLocked)
+    {
+        logMsg("PRE-VALIDATE: Reject LOCK - already locked (source=" + src + ")");
+        showMessage("ALREADY LOCKED", "");
+        buzzerError();
+        delay(800);
+        showMainScreen();
+
+        if (src == "BLUETOOTH")
+            sendResponse("ERROR: Already locked");
+        else if (src == "SERIAL")
+            Serial.println("ERROR: Already locked");
+        return false;
+    }
+
+    if (action == "UNLOCK" && !isLocked)
+    {
+        logMsg("PRE-VALIDATE: Reject UNLOCK - already unlocked (source=" + src + ")");
+        showMessage("ALREADY UNLOCKED", "");
+        buzzerError();
+        delay(800);
+        showMainScreen();
+
+        if (src == "BLUETOOTH")
+            sendResponse("ERROR: Already unlocked");
+        else if (src == "SERIAL")
+            Serial.println("ERROR: Already unlocked");
+        return false;
+    }
+
+    return true;
 }
+
+// ============================================================
+// LAYER 2: GATEKEEPER — PIN CHECK + DISPATCH
+// ------------------------------------------------------------
+// Assumes preValidateAction() has already passed. Only checks PIN
+// and dispatches the servo action.
+// ============================================================
+
+void handleServoAction(String action, String pin, String source)
+{
+    action.trim();
+    action.toUpperCase();
+    source.trim();
+    source.toUpperCase();
+
+    logMsg("GATEKEEPER: action=" + action + " source=" + source +
+           " state=" + getDoorStatus());
+
+    if (!validatePIN(pin))
+    {
+        logMsg("PIN: REJECTED (action=" + action + " source=" + source + ")");
+
+        showMessage("INVALID PIN", "");
+        buzzerError();
+        delay(1000);
+        showMainScreen();
+
+        if (source == "BLUETOOTH")
+            sendResponse("ERROR: Invalid PIN");
+        else if (source == "SERIAL")
+            Serial.println("ERROR: Invalid PIN");
+
+        return;
+    }
+
+    logMsg("PIN: ACCEPTED");
+
+    if (action == "LOCK")
+    {
+        showActionMessage("LOCKING...");
+        moveServo(SERVO_LOCK_POS);
+
+        isLocked = true;
+        disarmAutoLock();
+
+        buzzerBeep(100, 1200);
+        delay(500);
+        showMainScreen();
+        logMsg("SERVO: Door LOCKED");
+
+        if (source == "BLUETOOTH")
+            sendResponse("SUCCESS: Locked");
+        else if (source == "SERIAL")
+            Serial.println("SUCCESS: Locked");
+        return;
+    }
+
+    if (action == "UNLOCK")
+    {
+        showActionMessage("UNLOCKING...");
+        moveServo(SERVO_UNLOCK_POS);
+
+        isLocked = false;
+        unlockStartTime = millis();
+        armAutoLock();
+
+        buzzerSuccess();
+        delay(500);
+        showMainScreen();
+        logMsg("SERVO: Door UNLOCKED");
+
+        if (source == "BLUETOOTH")
+            sendResponse("SUCCESS: Unlocked");
+        else if (source == "SERIAL")
+            Serial.println("SUCCESS: Unlocked");
+        return;
+    }
+
+    logMsg("SERVO: Unknown action - " + action);
+    showMessage("UNKNOWN CMD", "");
+    buzzerError();
+    delay(800);
+    showMainScreen();
+}
+
+// ============================================================
+// LAYER 1: OUTER VALIDATION — STATE CHECK + DISPATCH
+// ------------------------------------------------------------
+// Thin wrapper: normalize source, log, run the central gate, then
+// hand off to the gatekeeper. No duplicate isLocked check here.
+// ============================================================
+
+void requestLockAction(String pin, String source)
+{
+    source.trim();
+    source.toUpperCase();
+
+    logMsg("REQUEST: LOCK from " + source + " (state=" + getDoorStatus() + ")");
+
+    if (!preValidateAction("LOCK", source))
+        return;
+
+    handleServoAction("LOCK", pin, source);
+}
+
+void requestUnlockAction(String pin, String source)
+{
+    source.trim();
+    source.toUpperCase();
+
+    logMsg("REQUEST: UNLOCK from " + source + " (state=" + getDoorStatus() + ")");
+
+    if (!preValidateAction("UNLOCK", source))
+        return;
+
+    handleServoAction("UNLOCK", pin, source);
+}
+
+// ============================================================
+// PIN MODE
+// ============================================================
 
 void resetPinMode()
 {
@@ -689,7 +792,12 @@ void resetPinMode()
 }
 
 // ============================================================
-// KEYPAD FUNCTIONS
+// KEYPAD
+// ------------------------------------------------------------
+// The keypad layer no longer pre-checks isLocked. Pressing A or B
+// routes the user into PIN entry; the central gate then decides
+// and shows "ALREADY LOCKED/UNLOCKED" if applicable. This keeps
+// the state decision in exactly one place.
 // ============================================================
 
 void processKeypad(char key)
@@ -699,8 +807,7 @@ void processKeypad(char key)
     lastKeyPressTime = millis();
     updateActivity();
 
-    logMsg("KEY: " + String(key));
-
+    Serial.println("Keypad pressed: " + String(key));
     keypadOperationInProgress = true;
 
     if (isPinMode)
@@ -708,7 +815,7 @@ void processKeypad(char key)
         if (!pinTimeoutTriggered && millis() - pinStartTime > PIN_TIMEOUT)
         {
             pinTimeoutTriggered = true;
-            logMsg("PIN: Timeout!");
+            Serial.println("PIN: Timeout!");
             showMessage("TIMEOUT", "");
             buzzerError();
             delay(1000);
@@ -722,7 +829,7 @@ void processKeypad(char key)
             if (pinBuffer.length() < 10)
             {
                 pinBuffer += key;
-                logMsg("PIN: Entered digit, buffer: " + pinBuffer);
+                Serial.println("Debug buffer: " + pinBuffer);
                 buzzerClick();
                 showPinEntry();
             }
@@ -732,49 +839,48 @@ void processKeypad(char key)
             if (pinBuffer.length() > 0)
             {
                 pinBuffer.remove(pinBuffer.length() - 1);
-                logMsg("PIN: Deleted digit, buffer: " + pinBuffer);
+                Serial.println("Debug buffer: " + pinBuffer + " (deleted)");
                 buzzerClick();
                 showPinEntry();
             }
         }
         else if (key == 'C' || key == 'c')
         {
-            logMsg("PIN: Confirming: " + pinBuffer);
             buzzerClick();
 
-            // Validate PIN using the validation function
-            if (validatePIN(pinBuffer))
-            {
-                logMsg("PIN: Correct!");
-                buzzerSuccess();
+            String enteredPin = pinBuffer;
+            String actionToRun = pendingAction;
 
-                // Use centralized servo control
-                if (pendingAction == "LOCK")
-                {
-                    handleServoAction("LOCK", "KEYPAD");
-                }
-                else if (pendingAction == "UNLOCK")
-                {
-                    handleServoAction("UNLOCK", "KEYPAD");
-                }
-                resetPinMode();
-            }
+            Serial.println("Debug buffer: " + enteredPin + " (confirmed)");
+            Serial.println("Pending action: " + actionToRun);
+
+            pinBuffer = "";
+            isPinMode = false;
+            pendingAction = "";
+            pinStartTime = 0;
+            pinTimeoutTriggered = false;
+
+            if (actionToRun == "LOCK")
+                requestLockAction(enteredPin, "KEYPAD");
+            else if (actionToRun == "UNLOCK")
+                requestUnlockAction(enteredPin, "KEYPAD");
             else
             {
-                // PIN validation failed - handle the failed attempt
-                handleFailedPINAttempt("KEYPAD");
+                Serial.println("PIN: No pending action - discarding");
+                showMainScreen();
             }
         }
         else if (key == '*')
         {
-            logMsg("PIN: Cancelled by user");
+            Serial.println("PIN: Cancelled by user");
             buzzerClick();
             resetPinMode();
         }
         else
         {
-            logMsg("PIN: Ignoring key - " + String(key));
+            Serial.println("PIN: Ignoring key - " + String(key));
         }
+
         keypadOperationInProgress = false;
         return;
     }
@@ -783,33 +889,19 @@ void processKeypad(char key)
     {
         if (key == '#')
         {
-            logMsg("DISPLAY: Showing temperature");
+            Serial.println("DISPLAY: Temperature");
             showTemperature();
             buzzerClick();
-            keypadOperationInProgress = false;
-            return;
         }
         else if (key == '*')
         {
-            logMsg("DISPLAY: Showing Bluetooth info");
+            Serial.println("DISPLAY: Bluetooth info");
             showBluetoothInfo();
             buzzerClick();
-            keypadOperationInProgress = false;
-            return;
         }
         else if (key == 'A' || key == 'a')
         {
-            // Do not duplicate the door-state check here.
-            // The centralized servo handler owns all lock/unlock state checks.
-            if (isLocked)
-            {
-                logMsg("KEYPAD: Already locked - rejecting LOCK");
-                handleServoAction("LOCK", "KEYPAD");
-                keypadOperationInProgress = false;
-                return;
-            }
-
-            logMsg("KEYPAD: Selected LOCK");
+            Serial.println("Keypad A: LOCK requested - enter PIN");
             pendingAction = "LOCK";
             isPinMode = true;
             pinBuffer = "";
@@ -817,21 +909,10 @@ void processKeypad(char key)
             pinTimeoutTriggered = false;
             buzzerClick();
             showPinEntry();
-            keypadOperationInProgress = false;
-            return;
         }
         else if (key == 'B' || key == 'b')
         {
-            // Check state before PIN entry
-            if (!isLocked)
-            {
-                logMsg("KEYPAD: Already unlocked - rejecting UNLOCK");
-                handleServoAction("UNLOCK", "KEYPAD"); // This will show the rejection message
-                keypadOperationInProgress = false;
-                return;
-            }
-
-            logMsg("KEYPAD: Selected UNLOCK");
+            Serial.println("Keypad B: UNLOCK requested - enter PIN");
             pendingAction = "UNLOCK";
             isPinMode = true;
             pinBuffer = "";
@@ -839,91 +920,26 @@ void processKeypad(char key)
             pinTimeoutTriggered = false;
             buzzerClick();
             showPinEntry();
-            keypadOperationInProgress = false;
-            return;
         }
         else if (key >= '0' && key <= '9')
         {
-            logMsg("MAIN: Ignoring number - " + String(key));
-            keypadOperationInProgress = false;
-            return;
+            Serial.println("MAIN: Ignoring number - " + String(key));
         }
         else
         {
-            logMsg("MAIN: Ignoring key - " + String(key));
-            keypadOperationInProgress = false;
-            return;
+            Serial.println("MAIN: Ignoring key - " + String(key));
         }
     }
     else
     {
-        logMsg("DISPLAY: Ignoring key in non-main mode");
-        keypadOperationInProgress = false;
+        Serial.println("DISPLAY: Ignoring key in non-main mode");
     }
+
+    keypadOperationInProgress = false;
 }
 
 // ============================================================
-// RFID FUNCTIONS
-// ============================================================
-
-void processRFID()
-{
-    if (keypadOperationInProgress)
-        return;
-
-    if (!rfidInitialized)
-        return;
-
-    static unsigned long lastCheck = 0;
-    if (millis() - lastCheck < 30)
-        return;
-    lastCheck = millis();
-
-    if (millis() - rfidCooldown < RFID_COOLDOWN)
-        return;
-
-    if (!mfrc522.PICC_IsNewCardPresent())
-        return;
-
-    if (!mfrc522.PICC_ReadCardSerial())
-        return;
-
-    String uid = "";
-    for (byte i = 0; i < mfrc522.uid.size; i++)
-    {
-        if (mfrc522.uid.uidByte[i] < 0x10)
-            uid += "0";
-        uid += String(mfrc522.uid.uidByte[i], HEX);
-    }
-    uid.toUpperCase();
-
-    logMsg("RFID: Tag detected - UID: " + uid);
-
-    updateActivity();
-    showMessage(uid, "SCANNED");
-    buzzerClick();
-    delay(300);
-
-    if (isPinMode)
-        resetPinMode();
-
-    // RFID toggles - use centralized function
-    if (isLocked)
-    {
-        handleServoAction("UNLOCK", "RFID");
-    }
-    else
-    {
-        handleServoAction("LOCK", "RFID");
-    }
-
-    mfrc522.PICC_HaltA();
-    mfrc522.PCD_StopCrypto1();
-    rfidCooldown = millis();
-}
-
-// ============================================================
-// BLUETOOTH FUNCTIONS
+// BLUETOOTH
 // ============================================================
 
 void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
@@ -950,6 +966,7 @@ void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
         connectedDeviceAddress = "";
         logMsg("BT: Device disconnected");
         buzzerBeep(100, 800);
+        servoReassert();
         showMainScreen();
         break;
     default:
@@ -957,32 +974,44 @@ void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
     }
 }
 
-// Validate Bluetooth command format
-bool isValidBTCommand(String cmd)
+bool parseBTCommand(String cmd, String &action, String &pin)
 {
-    // Check if command is empty
-    if (cmd.length() == 0)
-        return false;
+    cmd.trim();
 
-    // Check if command starts with PIN
-    if (!cmd.startsWith(BACKDOOR_KEY))
-        return false;
-
-    // Check if there's anything after the PIN
-    if (cmd.length() <= BACKDOOR_KEY.length())
-        return false;
-
-    // Check if the command part is exactly _BT_LOCK, _BT_UNLOCK, or _BT_STATUS
-    String action = cmd.substring(BACKDOOR_KEY.length());
-    action.trim();
-    action.toUpperCase();
-
-    // Valid commands
-    if (action == "_BT_LOCK" ||
-        action == "_BT_UNLOCK" ||
-        action == "_BT_STATUS")
+    int colon = cmd.indexOf(':');
+    if (colon > 0)
     {
+        action = cmd.substring(0, colon);
+        pin = cmd.substring(colon + 1);
+        action.trim();
+        pin.trim();
+        action.toUpperCase();
         return true;
+    }
+
+    if (cmd.startsWith(BACKDOOR_KEY))
+    {
+        String rest = cmd.substring(BACKDOOR_KEY.length());
+        rest.trim();
+        rest.toUpperCase();
+        if (rest == "_BT_LOCK")
+        {
+            action = "LOCK";
+            pin = BACKDOOR_KEY;
+            return true;
+        }
+        if (rest == "_BT_UNLOCK")
+        {
+            action = "UNLOCK";
+            pin = BACKDOOR_KEY;
+            return true;
+        }
+        if (rest == "_BT_STATUS")
+        {
+            action = "STATUS";
+            pin = BACKDOOR_KEY;
+            return true;
+        }
     }
 
     return false;
@@ -994,15 +1023,12 @@ void processBT(String cmd)
     logMsg("BT: Command received - " + cmd);
     updateActivity();
 
-    // ============================================================
-    // STEP 1: VALIDATE COMMAND FORMAT
-    // ============================================================
-    if (!isValidBTCommand(cmd))
-    {
-        logMsg("BT: Invalid command format - rejected");
-        sendResponse("ERROR: Invalid command format");
+    String action, pin;
 
-        // Show feedback with proper delay
+    if (!parseBTCommand(cmd, action, pin))
+    {
+        logMsg("BT: Unrecognized command format");
+        sendResponse("ERROR: Invalid format. Use LOCK:pin / UNLOCK:pin / STATUS:pin");
         showMessage("INVALID CMD", "");
         buzzerError();
         delay(800);
@@ -1010,100 +1036,121 @@ void processBT(String cmd)
         return;
     }
 
-    // ============================================================
-    // STEP 2: EXTRACT AND VALIDATE ACTION
-    // ============================================================
-    String action = cmd.substring(BACKDOOR_KEY.length());
-    action.trim();
-    action.toUpperCase();
-
-    logMsg("BT: Authentication successful - Action: " + action);
-
-    // ============================================================
-    // STEP 3: PROCESS VALID COMMANDS WITH VISUAL FEEDBACK
-    // ============================================================
-
-    // Handle LOCK command
-    if (action == "_BT_LOCK")
+    if (action == "STATUS")
     {
-        // Immediate visual feedback
-        showMessage("BT LOCK", "REQUESTED");
-        delay(BT_FEEDBACK_DELAY);
+        if (!validatePIN(pin))
+        {
+            logMsg("BT: STATUS rejected - bad PIN");
+            sendResponse("ERROR: Invalid PIN");
+            showMessage("INVALID PIN", "");
+            buzzerError();
+            delay(800);
+            showMainScreen();
+            return;
+        }
 
-        // Let handleServoAction handle the state check
-        handleServoAction("LOCK", "BLUETOOTH");
-        // handleServoAction handles its own delays and display updates
-    }
-    // Handle UNLOCK command
-    else if (action == "_BT_UNLOCK")
-    {
-        // Immediate visual feedback
-        showMessage("BT UNLOCK", "REQUESTED");
-        delay(BT_FEEDBACK_DELAY);
-
-        // Let handleServoAction handle the state check
-        handleServoAction("UNLOCK", "BLUETOOTH");
-        // handleServoAction handles its own delays and display updates
-    }
-    // Handle STATUS command (read-only, no servo)
-    else if (action == "_BT_STATUS")
-    {
-        // Show status on LCD with proper delay
         String status = getDoorStatus();
         showMessage("STATUS", status);
         delay(800);
         showMainScreen();
 
-        // Send status response via Bluetooth
-        int servoPosition = myServo.read();
         bool positionOK = isServoAtExpectedPosition();
 
         sendResponse("STATUS: " + status);
-        sendResponse("SERVO: " + String(servoPosition) +
+        sendResponse("SERVO: " + String(currentServoPos) +
                      " EXPECTED: " + String(getExpectedServoPosition()) +
                      " CHECK: " + (positionOK ? "OK" : "MISMATCH"));
-
         reportDoorStatus("BT");
+        return;
     }
-    // This should never happen due to validation, but keep as safety
-    else
+
+    if (action == "LOCK")
     {
-        logMsg("BT: Unhandled command - " + action);
-        sendResponse("ERROR: Unhandled command");
-        showMessage("ERROR", "");
-        buzzerError();
-        delay(800);
-        showMainScreen();
+        showMessage("BT LOCK", "REQUESTED");
+        delay(BT_FEEDBACK_DELAY);
+        requestLockAction(pin, "BLUETOOTH");
+        return;
     }
+    if (action == "UNLOCK")
+    {
+        showMessage("BT UNLOCK", "REQUESTED");
+        delay(BT_FEEDBACK_DELAY);
+        requestUnlockAction(pin, "BLUETOOTH");
+        return;
+    }
+
+    logMsg("BT: Unknown action - " + action);
+    sendResponse("ERROR: Unknown action");
+    showMessage("UNKNOWN CMD", "");
+    buzzerError();
+    delay(800);
+    showMainScreen();
 }
 
 // ============================================================
 // AUTO LOCK
 // ============================================================
 
+void armAutoLock()
+{
+    autoLockArmed = true;
+    lastUserActivity = millis();
+    logMsg("AUTO-LOCK: Armed (" + String(AUTO_LOCK_DELAY / 1000) + "s idle)");
+}
+
+void disarmAutoLock()
+{
+    if (autoLockArmed)
+        logMsg("AUTO-LOCK: Disarmed");
+    autoLockArmed = false;
+}
+
 void checkAutoLock()
 {
-    if (!autoLockPending)
+    if (!autoLockArmed)
         return;
+
     if (isLocked)
     {
-        autoLockPending = false;
+        disarmAutoLock();
         return;
     }
 
-    if (millis() - unlockStartTime > AUTO_LOCK_DELAY)
+    if (isPinMode && (millis() - lastKeyPressTime < AUTO_LOCK_GRACE))
+        return;
+
+    if (isPinMode && (millis() - lastKeyPressTime >= AUTO_LOCK_GRACE))
     {
-        logMsg("AUTO-LOCK: Triggered after 20 seconds");
+        logMsg("AUTO-LOCK: Cancelling stale PIN entry");
+        pinBuffer = "";
+        isPinMode = false;
+        pendingAction = "";
+        pinStartTime = 0;
+        pinTimeoutTriggered = false;
+        showMainScreen();
+    }
+
+    if (currentDisplayMode != DISPLAY_MAIN)
+        return;
+
+    unsigned long idle = millis() - lastUserActivity;
+
+    if (idle >= AUTO_LOCK_DELAY)
+    {
+        logMsg("AUTO-LOCK: Firing after " + String(idle / 1000) + "s idle");
         showMessage("AUTO-LOCKING", "");
         buzzerBeep(100, 1000);
         delay(300);
-        handleServoAction("LOCK", "AUTO");
-        autoLockPending = false;
+
+        requestLockAction(BACKDOOR_KEY, "AUTO");
+
+        disarmAutoLock();
+        resetPinMode();
     }
 }
 
 // ============================================================
-// DHT11 FUNCTIONS
+// DHT11
 // ============================================================
 
 bool initDHT()
@@ -1168,59 +1215,137 @@ void processSerialCommands()
     logMsg("SERIAL: Command - " + cmd);
     updateActivity();
 
-    if (cmd == "lock")
+    int colon = cmd.indexOf(':');
+    String action, pin;
+
+    if (colon > 0)
     {
-        handleServoAction("LOCK", "SERIAL");
+        action = cmd.substring(0, colon);
+        pin = cmd.substring(colon + 1);
+        action.trim();
+        pin.trim();
     }
-    else if (cmd == "unlock")
+    else
     {
-        handleServoAction("UNLOCK", "SERIAL");
+        action = cmd;
+        pin = "";
     }
-    else if (cmd == "status")
+    action.toLowerCase();
+
+    if (action == "lock")
+        requestLockAction(pin, "SERIAL");
+    else if (action == "unlock")
+        requestUnlockAction(pin, "SERIAL");
+    else if (action == "status")
     {
-        // STATUS is read-only. It must never command or reposition the servo.
+        if (!validatePIN(pin))
+        {
+            Serial.println("ERROR: Invalid PIN");
+            showMessage("INVALID PIN", "");
+            buzzerError();
+            delay(800);
+            showMainScreen();
+            return;
+        }
         String status = getDoorStatus();
         Serial.println("STATUS: " + status);
-        Serial.println("SERVO: " + String(myServo.read()) +
+        Serial.println("SERVO: " + String(currentServoPos) +
                        " EXPECTED: " + String(getExpectedServoPosition()) +
                        " CHECK: " + (isServoAtExpectedPosition() ? "OK" : "MISMATCH"));
         reportDoorStatus("SERIAL");
     }
-    else if (cmd == "reset")
+    else if (action == "reset")
     {
+        if (!validatePIN(pin))
+        {
+            Serial.println("ERROR: Invalid PIN");
+            return;
+        }
         logMsg("SERIAL: Resetting system");
         showMessage("RESETTING...", "");
-        lockDoor();
-        delay(1000);
+        delay(500);
         ESP.restart();
     }
-    else if (cmd == "help")
+    else if (action == "help")
     {
-        Serial.println("\n=== SMART LOCK COMMANDS ===");
+        Serial.println("\n=== SMART LOCK COMMANDS (v1.27) ===");
+        Serial.println("All lock/unlock/status commands require PIN.");
+        Serial.println("Format: action:pin   (e.g. unlock:54321)");
+        Serial.println("");
         Serial.println("Keypad:");
-        Serial.println("  A       - Select LOCK (if unlocked)");
-        Serial.println("  B       - Select UNLOCK (if locked)");
-        Serial.println("  [PIN]   - Enter PIN (54321)");
+        Serial.println("  A       - Request LOCK  (central gate rejects if already locked)");
+        Serial.println("  B       - Request UNLOCK (central gate rejects if already unlocked)");
+        Serial.println("  [PIN]   - Enter PIN");
         Serial.println("  C       - Confirm PIN");
         Serial.println("  D       - Delete digit");
+        Serial.println("  *       - Cancel / Show Bluetooth info (main screen)");
         Serial.println("  #       - Show Temperature");
-        Serial.println("  *       - Show Bluetooth Info");
-        Serial.println("\nBluetooth (" + BACKDOOR_KEY + "_BT_*):");
-        Serial.println("  LOCK    - Lock door");
-        Serial.println("  UNLOCK  - Unlock door");
-        Serial.println("  STATUS  - Get door status (read-only)");
-        Serial.println("\nSerial:");
-        Serial.println("  lock      - Lock door");
-        Serial.println("  unlock    - Unlock door");
-        Serial.println("  status    - Get door status (read-only)");
-        Serial.println("  reset     - Reset system");
-        Serial.println("  help      - Show this menu");
-        Serial.println("==============================\n");
+        Serial.println("");
+        Serial.println("Bluetooth:");
+        Serial.println("  LOCK:54321    - Lock door (rejected if already locked)");
+        Serial.println("  UNLOCK:54321  - Unlock door (rejected if already unlocked)");
+        Serial.println("  STATUS:54321  - Get door status");
+        Serial.println("  (legacy 54321_BT_LOCK / _BT_UNLOCK / _BT_STATUS also work)");
+        Serial.println("");
+        Serial.println("Serial:");
+        Serial.println("  lock:54321     - Lock door");
+        Serial.println("  unlock:54321   - Unlock door");
+        Serial.println("  status:54321   - Get door status");
+        Serial.println("  reset:54321    - Reset system");
+        Serial.println("  help           - This menu");
+        Serial.println("====================================\n");
     }
     else
     {
-        Serial.println("Unknown command. Type 'help' for list.");
+        Serial.println("Unknown command. Type 'help'.");
     }
+}
+
+// ============================================================
+// RESET REASON
+// ============================================================
+
+void logResetReason()
+{
+    esp_reset_reason_t reason = esp_reset_reason();
+    const char *reasonStr = "UNKNOWN";
+    switch (reason)
+    {
+    case ESP_RST_POWERON:
+        reasonStr = "POWERON";
+        break;
+    case ESP_RST_EXT:
+        reasonStr = "EXT_PIN";
+        break;
+    case ESP_RST_SW:
+        reasonStr = "SOFTWARE";
+        break;
+    case ESP_RST_PANIC:
+        reasonStr = "PANIC/CRASH";
+        break;
+    case ESP_RST_INT_WDT:
+        reasonStr = "INT_WDT";
+        break;
+    case ESP_RST_TASK_WDT:
+        reasonStr = "TASK_WDT";
+        break;
+    case ESP_RST_WDT:
+        reasonStr = "WDT";
+        break;
+    case ESP_RST_DEEPSLEEP:
+        reasonStr = "DEEPSLEEP";
+        break;
+    case ESP_RST_BROWNOUT:
+        reasonStr = "BROWNOUT";
+        break;
+    case ESP_RST_SDIO:
+        reasonStr = "SDIO";
+        break;
+    default:
+        reasonStr = "UNKNOWN";
+        break;
+    }
+    logMsg("RESET REASON: " + String(reasonStr) + " (" + String((int)reason) + ")");
 }
 
 // ============================================================
@@ -1235,8 +1360,10 @@ void setup()
     systemStartTime = millis();
 
     logMsg("========================================");
-    logMsg("ESP32 Smart Lock v1.17 Starting...");
+    logMsg("ESP32 Smart Lock v1.27 Starting...");
     logMsg("========================================");
+
+    logResetReason();
 
     logMsg("LCD: Initializing...");
     Wire.begin();
@@ -1244,45 +1371,19 @@ void setup()
     lcd.begin();
     lcd.backlight();
     lcd.clear();
-    showMessage("Smart Lock", "v1.17 Starting...");
+    showMessage("Smart Lock", "v1.27 Starting...");
     delay(1000);
 
     logMsg("BUZZER: Initializing...");
     buzzerInit();
-    buzzerBeep(100);
+    buzzerBeep(100, 1500);
     delay(100);
-    buzzerBeep(100);
+    buzzerBeep(100, 1500);
 
     logMsg("SERVO: Initializing...");
     showMessage("Smart Lock", "Servo...");
     servoInit();
     delay(300);
-
-    logMsg("RFID: Initializing...");
-    showMessage("Smart Lock", "RFID...");
-    SPI.begin();
-    mfrc522.PCD_Init();
-    delay(100);
-
-    byte version = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-    logMsg("RFID: VersionReg = 0x" + String(version, HEX));
-    if (version == 0x92 || version == 0x91)
-    {
-        logMsg("RFID: Reader initialized OK!");
-        rfidInitialized = true;
-    }
-    else
-    {
-        logMsg("RFID WARNING: Invalid version! Check wiring.");
-        logMsg("RFID: Expected 0x92 or 0x91, got 0x" + String(version, HEX));
-        showMessage("RFID ERROR!", "Check wiring");
-        delay(2000);
-        rfidInitialized = false;
-    }
-    if (rfidInitialized)
-        logMsg("RFID: Ready");
-    else
-        logMsg("RFID: Disabled - reader failed initialization");
 
     showMessage("Smart Lock", "DHT...");
     initDHT();
@@ -1304,9 +1405,9 @@ void setup()
 
     logMsg("========================================");
     logMsg("SYSTEM: Ready!");
-    logMsg("KEYPAD: A=Lock (if unlocked), B=Unlock (if locked)");
+    logMsg("KEYPAD: A=Lock request, B=Unlock request (central gate validates)");
     logMsg("PIN: " + BACKDOOR_KEY);
-    logMsg("BT: " + BACKDOOR_KEY + "_BT_LOCK/UNLOCK/STATUS");
+    logMsg("BT: LOCK:pin / UNLOCK:pin / STATUS:pin");
     logMsg("========================================");
 
     buzzerSuccess();
@@ -1318,7 +1419,6 @@ void setup()
 
 void loop()
 {
-    processRFID();
     checkAutoLock();
     manageLCD();
     updateDHTData();
@@ -1336,5 +1436,18 @@ void loop()
     }
 
     processSerialCommands();
+
+    static unsigned long lastCountdownLog = 0;
+    if (autoLockArmed && !isLocked && millis() - lastCountdownLog > 5000)
+    {
+        lastCountdownLog = millis();
+        unsigned long idle = millis() - lastUserActivity;
+        long remaining = (long)AUTO_LOCK_DELAY - (long)idle;
+        if (remaining < 0)
+            remaining = 0;
+        Serial.println("[AUTO-LOCK] Idle " + String(idle / 1000) +
+                       "s, firing in " + String(remaining / 1000) + "s");
+    }
+
     delay(2);
 }

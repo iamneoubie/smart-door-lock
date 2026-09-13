@@ -187,9 +187,4 @@ esp-32-component-test.ino.cpp.o: \
  C:\Users\Admin\Documents\Arduino\libraries\enhance_esp32_servo\src/ESP32Servo.h \
  C:\Users\Admin\Documents\Arduino\libraries\enhance_esp32_servo\src/ESP32PWM.h \
  C:\Users\Admin\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.11\cores\esp32/esp32-hal-ledc.h \
- C:\Users\Admin\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.11\libraries\SPI\src/SPI.h \
- C:\Users\Admin\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.11\cores\esp32/esp32-hal-spi.h \
- C:\Users\Admin\Documents\Arduino\libraries\rfid\src/MFRC522.h \
- C:\Users\Admin\Documents\Arduino\libraries\rfid\src/require_cpp11.h \
- C:\Users\Admin\Documents\Arduino\libraries\rfid\src/deprecated.h \
  C:\Users\Admin\Documents\Arduino\libraries\dht_sensor/DHT.h
