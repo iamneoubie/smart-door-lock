@@ -1,49 +1,77 @@
 #include <Arduino.h>
 #line 1 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 /*
- * ESP32 Smart Lock System - VERSION 1.27
+ * ESP32 Smart Lock System - VERSION 1.42.0
  * ============================================
- * Changes from v1.26:
- * - FIXED servo twitch when buzzer fires while rejecting a command.
- *   Root cause: ledcWriteTone() for the buzzer was colliding with
- *   ESP32Servo's LEDC timer allocation, hijacking the servo PWM
- *   frequency and causing the servo to drift toward a random
- *   position (usually 0/unlocked) whenever buzzerError() ran.
- *
- *   Fix:
- *     1. Explicitly allocate LEDC timers 0+1 for the servo via
- *        ESP32PWM::allocateTimer().
- *     2. Attach the buzzer to a fixed, high LEDC channel (7) that
- *        does not overlap the servo timers.
- *     3. Re-assert myServo.write(currentServoPos) after every
- *        buzzer routine as a belt-and-suspenders guard.
- *
- * - CONSOLIDATED validators. Removed triple-redundant state checks.
- *   State gating now lives in ONE place: preValidateAction(),
- *   called from requestLockAction()/requestUnlockAction().
- *   The keypad layer no longer pre-checks isLocked; it just routes
- *   the user into PIN entry, and the central gate decides.
- *
- * - Keypad UX preserved: pressing A while locked still shows
- *   "ALREADY LOCKED" immediately (feedback comes from the central
- *   gate, not a duplicate check).
- *
- * Kept: two-layer validation, reset reason logging, modular structure,
- * configurable timings, BT/serial/keypad parity.
+ * - FIXED: Lockout LCD deadlock at "WAIT 0 SEC".
+ *     * checkLockoutExpiry() runs before manageLCD() in loop().
+ *     * renderLockoutCountdown() refuses to render at secs == 0 and
+ *       immediately hands off to showMainScreen().
+ *     * showMainScreen() explicitly sets currentDisplayMode and
+ *       resets lastRenderedSec before checking inLockout().
+ * - FIXED: /sensors/attempts now reliably transitions back to
+ *   {left:3, lockedOut:false} on expiry. Follows from the LCD fix:
+ *   checkLockoutExpiry() now always runs, which calls publishAttempts().
+ * - OPTIMIZED: attempts and status pushes no longer rate-limited to 1 Hz.
+ *   The flags are set only on real changes, so immediate write is safe.
+ * - OPTIMIZED: publishAttempts() snapshots values at call time so
+ *   racing publishes cannot overwrite a newer snapshot with an older one.
+ * - OPTIMIZED: task loop orders attempts -> status -> data sync -> cache
+ *   refresh, so fast operations never wait on slow ones.
+ * - CHANGED: /data no longer merges /sensors. /data is a stable mirror
+ *   of users + passkeys only. Live sensor state lives at /sensors.
+ * - CARRIED: background Firebase task on core 0, main loop never
+ *   blocks on network, PIN cache (16 slots), 60 s lockout, live push
+ *   of status and attempts, old main screen.
  */
 
-#include "BluetoothSerial.h"
+// ============================================================
+// BUILD OPTIONS
+// ============================================================
+#define ENABLE_BLUETOOTH 0
+
 #include <Keypad.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <ESP32Servo.h>
-#include <DHT.h>
 #include <esp_system.h>
+
+#if ENABLE_BLUETOOTH
+#include "BluetoothSerial.h"
+BluetoothSerial SerialBT;
+#endif
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <NetworkClientSecure.h>
+#include <ArduinoJson.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+
+// ============================================================
+// NETWORK CONFIGURATION
+// ============================================================
+#define WIFI_SSID "AP"
+#define WIFI_PASSWORD "admin123"
+
+const char *FIREBASE_URL = "https://smart-lock-d7f5a-default-rtdb.firebaseio.com";
+
+const unsigned long FIREBASE_POLL_INTERVAL = 1500;
+const unsigned long CACHE_REFRESH_INTERVAL = 60000;
+const unsigned long HTTP_TIMEOUT_MS = 3000;
+const unsigned long FIREBASE_SESSION_TIMEOUT = 30000;
+
+const int FB_FAIL_THRESHOLD = 5;
+const unsigned long FB_BACKOFF_MS = 5000;
+
+// PIN attempt policy
+const uint8_t MAX_ATTEMPTS = 3;
+const unsigned long ATTEMPT_TIMEOUT = 60000UL;
 
 // ============================================================
 // PIN CONFIGURATION
 // ============================================================
-
 const byte ROWS = 4;
 const byte COLS = 4;
 char keys[ROWS][COLS] = {
@@ -60,67 +88,41 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 #define LCD_ROWS 2
 LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
 
-#define DHT_PIN 17
-#define DHT_TYPE DHT11
-DHT dht(DHT_PIN, DHT_TYPE);
-
 #define SERVO_PIN 2
 Servo myServo;
 
 #define BUZZER_PIN 16
 #define BUZZER_FREQ 1500
-#define BUZZER_LEDC_CHANNEL 7 // explicit, non-overlapping with servo timers
+#define BUZZER_LEDC_CHANNEL 7
 #define BUZZER_LEDC_RES 8
-
-BluetoothSerial SerialBT;
 
 // ============================================================
 // SYSTEM CONSTANTS
 // ============================================================
-
 const char *BLUETOOTH_NAME = "Smart Lock";
 const String BACKDOOR_KEY = "54321";
-const int PIN_LENGTH = 5;
-
 const bool MASK_PIN_ON_LCD = false;
 
 const int SERVO_LOCK_POS = 120;
 const int SERVO_UNLOCK_POS = 0;
-const int SERVO_POSITION_TOLERANCE = 3;
 
-// ============================================================
-// USER-CONFIGURABLE TIMINGS
-// ============================================================
-
-const unsigned long DEBOUNCE_DELAY = 80;
+const unsigned long DEBOUNCE_DELAY = 30;
 const unsigned long LCD_UPDATE_INTERVAL = 200;
-
 const unsigned long SCREEN_TIMEOUT = 30000;
 const unsigned long PIN_TIMEOUT = 10000;
-
 const unsigned long AUTO_LOCK_DELAY = 10000;
 const unsigned long AUTO_LOCK_GRACE = 3000;
-
-const unsigned long DISPLAY_DURATION = 3000;
-
-const unsigned long DHT_READ_INTERVAL = 2000;
-const unsigned long BT_FEEDBACK_DELAY = 300;
 const unsigned long SERVO_SETTLE_DELAY = 1000;
+const unsigned long OVERRIDE_MSG_DURATION = 900;
 
 // ============================================================
-// SYSTEM STATE
+// SYSTEM STATE (main loop / core 1)
 // ============================================================
-
 bool isLocked = true;
-bool btConnected = false;
-String connectedDeviceAddress = "";
 unsigned long systemStartTime = 0;
 unsigned long lastActivityTime = 0;
 unsigned long lastKeyPressTime = 0;
 unsigned long lastLCDUpdateTime = 0;
-unsigned long unlockStartTime = 0;
-unsigned long lastDHTReadTime = 0;
-bool keypadOperationInProgress = false;
 
 int currentServoPos = SERVO_LOCK_POS;
 
@@ -134,154 +136,186 @@ bool isPinMode = false;
 unsigned long pinStartTime = 0;
 bool pinTimeoutTriggered = false;
 
+uint8_t attemptsLeft = MAX_ATTEMPTS;
+unsigned long lockoutUntil = 0;
+
+unsigned long lastRenderedSec = 0xFFFFFFFFUL;
+
+unsigned long overrideUntil = 0;
+
 enum DisplayMode
 {
     DISPLAY_MAIN,
-    DISPLAY_TEMPERATURE,
-    DISPLAY_BLUETOOTH
+    DISPLAY_LOCKOUT,
+    DISPLAY_ADD_KEY_SELECT,
+    DISPLAY_ADD_KEY_PIN,
+    DISPLAY_REMOVE_KEY_UID
 };
 DisplayMode currentDisplayMode = DISPLAY_MAIN;
-unsigned long displayStartTime = 0;
-
-float lastTemperature = 0;
-float lastHumidity = 0;
-bool hasDHTData = false;
 
 unsigned long lastUserActivity = 0;
 bool autoLockArmed = false;
 
+bool firebaseSessionActive = false;
+String sessionBuffer = "";
+unsigned long sessionStartTime = 0;
+unsigned long lastSessionActivity = 0;
+
+// ============================================================
+// SHARED STATE (accessed by both cores)
+// ============================================================
+volatile uint8_t g_pendingCmd = 0;
+volatile bool g_requestStatusPush = false;
+volatile bool g_requestAttemptsPush = false;
+volatile bool g_requestDataSync = false;
+
+// Snapshots taken by publishAttempts()/publishStatus() at call time
+volatile bool g_isLockedSnapshot = true;
+volatile uint8_t g_attemptsLeftSnapshot = MAX_ATTEMPTS;
+volatile bool g_lockedOutSnapshot = false;
+
+SemaphoreHandle_t g_cacheMutex = NULL;
+char g_pinCache[16][12];
+uint8_t g_pinCacheCount = 0;
+int g_pinCacheMaxUID = 0;
+
+SemaphoreHandle_t g_httpMutex = NULL;
+
+int fbConsecutiveFailures = 0;
+unsigned long fbBackoffUntil = 0;
+
 // ============================================================
 // FORWARD DECLARATIONS
 // ============================================================
+void showMainScreen();
+void showOverride(const String &r0, const String &r1, unsigned long ms);
+void showLockoutScreen();
+void renderLockoutCountdown();
 
 void resetPinMode();
-void showMainScreen();
-void showMessage(String msg1, String msg2);
 void armAutoLock();
 void disarmAutoLock();
-void handleServoAction(String action, String pin, String source);
 void requestLockAction(String pin, String source);
 void requestUnlockAction(String pin, String source);
 bool preValidateAction(const String &action, const String &source);
+void handleServoAction(String action, String pin, String source);
+void handleWrongPin(const String &source);
+void handleCorrectPin();
+bool validatePIN(const String &pin);
+String nextAvailableUID();
+bool inLockout();
+unsigned long lockoutRemainingSec();
+void checkLockoutExpiry();
+void processKeypad(char key);
+void processSerialCommands();
+void manageLCD();
+void updateLCD();
+void setLCD(int row, const String &text);
+void updateActivity();
+
+void startAddKeySession();
+void startRemoveKeySession();
+void finishFirebaseSession();
+bool processFirebaseSessionKey(char key);
+void checkFirebaseSessionTimeout();
+
+void publishStatus();
+void publishAttempts();
+
+bool firebasePut(const String &path, const String &value);
+String firebaseGet(const String &path);
+bool firebaseDelete(const String &path);
+String stripOuterQuotes(String s);
+void syncDataNode();
+void refreshCacheFromFirebase();
+void firebaseTask(void *pv);
+void logResetReason();
 
 // ============================================================
 // HELPERS
 // ============================================================
-
-#line 169 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 235 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 String getTimestamp();
-#line 182 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 248 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void logMsg(String msg);
-#line 191 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void setLCD(int row, const String &text);
-#line 217 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void updateLCD();
-#line 241 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void showPinEntry();
-#line 262 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void showActionMessage(String msg);
-#line 276 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void showTemperature();
-#line 323 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void showBluetoothInfo();
-#line 343 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void updateActivity();
-#line 357 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void manageLCD();
-#line 395 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 250 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void logHeap(const char *tag);
+#line 476 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void buzzerInit();
-#line 401 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void buzzerBeep(int duration, int freq);
-#line 410 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 481 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+void buzzerBeep(int dur, int freq);
+#line 487 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void servoReassert();
-#line 415 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 488 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void buzzerSuccess();
-#line 423 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 495 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void buzzerError();
-#line 433 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 504 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void buzzerClick();
-#line 443 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-String getDoorStatus();
-#line 448 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-int getExpectedServoPosition();
-#line 453 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-bool isServoAtExpectedPosition();
-#line 458 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void reportDoorStatus(const String &source);
-#line 477 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 510 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void servoInit();
-#line 497 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 523 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void moveServo(int target);
-#line 508 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void sendResponse(String msg);
-#line 518 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-bool validatePIN(String pin);
-#line 730 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void processKeypad(char key);
-#line 872 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param);
-#line 904 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-bool parseBTCommand(String cmd, String &action, String &pin);
-#line 947 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void processBT(String cmd);
-#line 1035 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 1082 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void checkAutoLock();
-#line 1083 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-bool initDHT();
 #line 1111 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void updateDHTData();
-#line 1132 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void processSerialCommands();
-#line 1235 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
-void logResetReason();
-#line 1282 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+static void fbRecordSuccess();
+#line 1113 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+static void fbRecordFailure();
+#line 1125 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+static bool fbInBackoff();
+#line 1537 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void setup();
-#line 1347 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 1588 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 void loop();
-#line 169 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
+#line 235 "D:\\Repository\\smart-door-lock\\test\\esp-32-component-test\\esp-32-component-test.ino"
 String getTimestamp()
 {
     unsigned long elapsed = millis() - systemStartTime;
-    unsigned long seconds = elapsed / 1000;
-    unsigned long minutes = seconds / 60;
-    unsigned long hours = minutes / 60;
-    seconds %= 60;
-    minutes %= 60;
-    char timeStr[20];
-    snprintf(timeStr, sizeof(timeStr), "%02lu:%02lu:%02lu", hours, minutes, seconds);
-    return String(timeStr);
+    unsigned long s = elapsed / 1000;
+    unsigned long m = s / 60;
+    unsigned long h = m / 60;
+    s %= 60;
+    m %= 60;
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu", h, m, s);
+    return String(buf);
 }
 
-void logMsg(String msg)
+void logMsg(String msg) { Serial.println("[" + getTimestamp() + "] " + msg); }
+
+void logHeap(const char *tag)
 {
-    Serial.println("[" + getTimestamp() + "] " + msg);
+    Serial.print("[");
+    Serial.print(getTimestamp());
+    Serial.print("] ");
+    Serial.print(tag);
+    Serial.print(": free=");
+    Serial.print(ESP.getFreeHeap());
+    Serial.print(" maxalloc=");
+    Serial.println(ESP.getMaxAllocHeap());
 }
-
-// ============================================================
-// LCD
-// ============================================================
 
 void setLCD(int row, const String &text)
 {
-    String trimmed = text;
-    if (trimmed.length() > 16)
-        trimmed = trimmed.substring(0, 16);
-    while (trimmed.length() < 16)
-        trimmed += " ";
-
+    String t = text;
+    if (t.length() > 16)
+        t = t.substring(0, 16);
+    while (t.length() < 16)
+        t += " ";
     if (row == 0)
     {
-        if (lcdRow0 != trimmed)
+        if (lcdRow0 != t)
         {
-            lcdRow0 = trimmed;
+            lcdRow0 = t;
             lcdNeedsUpdate = true;
         }
     }
     else
     {
-        if (lcdRow1 != trimmed)
+        if (lcdRow1 != t)
         {
-            lcdRow1 = trimmed;
+            lcdRow1 = t;
             lcdNeedsUpdate = true;
         }
     }
@@ -293,7 +327,6 @@ void updateLCD()
         return;
     if (millis() - lastLCDUpdateTime < LCD_UPDATE_INTERVAL)
         return;
-
     lastLCDUpdateTime = millis();
     lcd.setCursor(0, 0);
     lcd.print(lcdRow0);
@@ -302,124 +335,11 @@ void updateLCD()
     lcdNeedsUpdate = false;
 }
 
-void showMainScreen()
-{
-    currentDisplayMode = DISPLAY_MAIN;
-    String status = isLocked ? "LOCKED" : "UNLOCKED";
-    setLCD(0, status);
-    setLCD(1, "A=LOCK B=UNLOCK");
-    updateLCD();
-}
-
-void showPinEntry()
-{
-    setLCD(0, "ENTER PIN");
-
-    String display = "";
-    if (MASK_PIN_ON_LCD)
-    {
-        for (unsigned int i = 0; i < pinBuffer.length(); i++)
-            display += "*";
-    }
-    else
-    {
-        display = pinBuffer;
-    }
-
-    while (display.length() < 16)
-        display += " ";
-    setLCD(1, display);
-    updateLCD();
-}
-
-void showActionMessage(String msg)
-{
-    setLCD(0, msg);
-    setLCD(1, "");
-    updateLCD();
-}
-
-void showMessage(String msg1, String msg2)
-{
-    setLCD(0, msg1);
-    setLCD(1, msg2);
-    updateLCD();
-}
-
-void showTemperature()
-{
-    currentDisplayMode = DISPLAY_TEMPERATURE;
-    displayStartTime = millis();
-
-    float h = dht.readHumidity();
-    float t = dht.readTemperature();
-
-    if (!isnan(h) && !isnan(t))
-    {
-        lastTemperature = t;
-        lastHumidity = h;
-        hasDHTData = true;
-        char line1[17], line2[17];
-        snprintf(line1, sizeof(line1), "TEMP: %2.0f C", t);
-        snprintf(line2, sizeof(line2), "HUM:  %2.0f %%", h);
-        setLCD(0, String(line1));
-        setLCD(1, String(line2));
-        logMsg("DHT: T:" + String(t, 1) + "C, H:" + String(h, 1) + "%");
-    }
-    else
-    {
-        delay(100);
-        h = dht.readHumidity();
-        t = dht.readTemperature();
-        if (!isnan(h) && !isnan(t))
-        {
-            lastTemperature = t;
-            lastHumidity = h;
-            hasDHTData = true;
-            char line1[17], line2[17];
-            snprintf(line1, sizeof(line1), "TEMP: %2.0f C", t);
-            snprintf(line2, sizeof(line2), "HUM:  %2.0f %%", h);
-            setLCD(0, String(line1));
-            setLCD(1, String(line2));
-            logMsg("DHT: T:" + String(t, 1) + "C, H:" + String(h, 1) + "% (retry)");
-        }
-        else
-        {
-            setLCD(0, "TEMP: ERROR");
-            setLCD(1, "READ FAILED");
-            logMsg("DHT: Read error");
-        }
-    }
-    updateLCD();
-}
-
-void showBluetoothInfo()
-{
-    currentDisplayMode = DISPLAY_BLUETOOTH;
-    displayStartTime = millis();
-
-    if (btConnected && connectedDeviceAddress.length() > 0)
-    {
-        setLCD(0, "CONNECTED DEVICE");
-        setLCD(1, connectedDeviceAddress);
-        logMsg("BT: Displaying - " + connectedDeviceAddress);
-    }
-    else
-    {
-        setLCD(0, "CONNECTED DEVICE");
-        setLCD(1, "NO CONNECTION");
-        logMsg("BT: Displaying - No connection");
-    }
-    updateLCD();
-}
-
 void updateActivity()
 {
     lastActivityTime = millis();
-
     if (autoLockArmed && !isLocked)
         lastUserActivity = millis();
-
     if (!lcd.getBacklight())
     {
         lcd.backlight();
@@ -427,64 +347,181 @@ void updateActivity()
     }
 }
 
-void manageLCD()
+// ============================================================
+// DISPLAY
+// ============================================================
+void showMainScreen()
 {
-    if (millis() - lastActivityTime > SCREEN_TIMEOUT)
-    {
-        if (lcd.getBacklight())
-            lcd.noBacklight();
-    }
-    else
-    {
-        if (!lcd.getBacklight())
-        {
-            lcd.backlight();
-            lcdNeedsUpdate = true;
-        }
-    }
-
-    if (currentDisplayMode == DISPLAY_TEMPERATURE || currentDisplayMode == DISPLAY_BLUETOOTH)
-    {
-        if (millis() - displayStartTime > DISPLAY_DURATION)
-        {
-            logMsg("DISPLAY: Timeout - returning to main");
-            showMainScreen();
-        }
-    }
-
+    // Force a clean transition: this function is the terminal state
+    // after any override, lockout, or session ends.
+    currentDisplayMode = DISPLAY_MAIN;
+    lastRenderedSec = 0xFFFFFFFFUL;
+    overrideUntil = 0;
+    setLCD(0, isLocked ? "LOCKED" : "UNLOCKED");
+    setLCD(1, "A=LOCK B=UNLOCK");
     updateLCD();
 }
 
-// ============================================================
-// BUZZER  (fixed: dedicated LEDC channel, servo re-assertion)
-// ------------------------------------------------------------
-// ESP32Servo uses LEDC timers. ledcWriteTone() on a channel that
-// shares a timer with the servo will change that timer's frequency,
-// corrupting the servo pulse train and causing a twitch. We attach
-// the buzzer to channel 7 explicitly, and after every buzzer
-// routine we re-assert the servo position as a safety net.
-// ============================================================
+void showOverride(const String &r0, const String &r1, unsigned long ms)
+{
+    setLCD(0, r0);
+    setLCD(1, r1);
+    updateLCD();
+    overrideUntil = millis() + ms;
+}
 
+void renderLockoutCountdown()
+{
+    unsigned long secs = lockoutRemainingSec();
+
+    // secs == 0 means lockout just expired (or is about to). Do NOT
+    // render "WAIT 0 SEC" — hand off to the main screen immediately.
+    // checkLockoutExpiry() will run on the next loop tick and clear
+    // lockoutUntil + attemptsLeft + publish to Firebase.
+    if (secs == 0)
+    {
+        showMainScreen();
+        return;
+    }
+
+    if (secs == lastRenderedSec)
+        return;
+    lastRenderedSec = secs;
+    setLCD(0, "LOCKED OUT");
+    char line[17];
+    snprintf(line, sizeof(line), "WAIT %2lu SEC", secs);
+    setLCD(1, String(line));
+    updateLCD();
+}
+
+void showLockoutScreen()
+{
+    if (currentDisplayMode != DISPLAY_LOCKOUT)
+    {
+        currentDisplayMode = DISPLAY_LOCKOUT;
+        lastRenderedSec = 0xFFFFFFFFUL;
+    }
+    renderLockoutCountdown();
+}
+
+// ============================================================
+// LOCKOUT / ATTEMPTS
+// ============================================================
+bool inLockout()
+{
+    if (lockoutUntil == 0)
+        return false;
+    if ((long)(millis() - lockoutUntil) >= 0)
+    {
+        // Do NOT clear state here — checkLockoutExpiry() owns that
+        // transition so publishing happens exactly once.
+        return false;
+    }
+    return true;
+}
+
+unsigned long lockoutRemainingSec()
+{
+    if (lockoutUntil == 0)
+        return 0;
+    long d = (long)(lockoutUntil - millis());
+    if (d <= 0)
+        return 0;
+    return (unsigned long)((d + 999) / 1000);
+}
+
+void checkLockoutExpiry()
+{
+    if (lockoutUntil == 0)
+        return;
+    if ((long)(millis() - lockoutUntil) < 0)
+        return;
+
+    // Atomic reset — must happen in this order so publishAttempts()
+    // snapshots the correct new values.
+    lockoutUntil = 0;
+    attemptsLeft = MAX_ATTEMPTS;
+    logMsg("LOCKOUT: expired, attempts reset");
+
+    // Publish the new state to Firebase (background task handles it)
+    publishAttempts();
+
+    // Reset display unconditionally — no inLockout() re-entry check
+    currentDisplayMode = DISPLAY_MAIN;
+    lastRenderedSec = 0xFFFFFFFFUL;
+    overrideUntil = 0;
+    setLCD(0, isLocked ? "LOCKED" : "UNLOCKED");
+    setLCD(1, "A=LOCK B=UNLOCK");
+    updateLCD();
+}
+
+void publishAttempts()
+{
+    // Snapshot NOW, so if the task doesn't run for a while it still
+    // writes the values that were current when this was called.
+    g_attemptsLeftSnapshot = attemptsLeft;
+    g_lockedOutSnapshot = (lockoutUntil != 0) &&
+                          ((long)(millis() - lockoutUntil) < 0);
+    g_requestAttemptsPush = true;
+}
+
+void publishStatus()
+{
+    g_isLockedSnapshot = isLocked;
+    g_requestStatusPush = true;
+}
+
+void handleWrongPin(const String &source)
+{
+    if (attemptsLeft > 0)
+        attemptsLeft--;
+    logMsg("PIN: wrong, attempts left=" + String(attemptsLeft));
+    buzzerError();
+
+    if (attemptsLeft == 0)
+    {
+        lockoutUntil = millis() + ATTEMPT_TIMEOUT;
+        logMsg("LOCKOUT: engaged for " + String(ATTEMPT_TIMEOUT / 1000) + " s");
+        publishAttempts();
+        showLockoutScreen();
+        if (source == "SERIAL")
+            Serial.println("ERROR: Locked out");
+        return;
+    }
+
+    char line[17];
+    if (attemptsLeft == 1)
+        snprintf(line, sizeof(line), "1 ATTEMPT LEFT");
+    else
+        snprintf(line, sizeof(line), "%u ATTEMPTS LEFT", (unsigned)attemptsLeft);
+    showOverride("INVALID PIN", String(line), OVERRIDE_MSG_DURATION);
+    publishAttempts();
+}
+
+void handleCorrectPin()
+{
+    bool changed = (attemptsLeft != MAX_ATTEMPTS) || (lockoutUntil != 0);
+    attemptsLeft = MAX_ATTEMPTS;
+    lockoutUntil = 0;
+    if (changed)
+        publishAttempts();
+}
+
+// ============================================================
+// BUZZER / SERVO
+// ============================================================
 void buzzerInit()
 {
     ledcAttachChannel(BUZZER_PIN, BUZZER_FREQ, BUZZER_LEDC_RES, BUZZER_LEDC_CHANNEL);
     delay(50);
 }
-
-void buzzerBeep(int duration, int freq)
+void buzzerBeep(int dur, int freq)
 {
     ledcWriteTone(BUZZER_PIN, freq);
-    delay(duration);
+    delay(dur);
     ledcWrite(BUZZER_PIN, 0);
 }
-
-// Re-assert servo after any tone burst so any residual PWM
-// disturbance is immediately corrected.
-void servoReassert()
-{
-    myServo.write(currentServoPos);
-}
-
+void servoReassert() { myServo.write(currentServoPos); }
 void buzzerSuccess()
 {
     buzzerBeep(100, 2000);
@@ -492,7 +529,6 @@ void buzzerSuccess()
     buzzerBeep(100, 2500);
     servoReassert();
 }
-
 void buzzerError()
 {
     for (int i = 0; i < 3; i++)
@@ -502,304 +538,454 @@ void buzzerError()
     }
     servoReassert();
 }
-
 void buzzerClick()
 {
     buzzerBeep(30, 1500);
     servoReassert();
 }
 
-// ============================================================
-// DOOR STATUS
-// ============================================================
-
-String getDoorStatus()
-{
-    return isLocked ? "LOCKED" : "UNLOCKED";
-}
-
-int getExpectedServoPosition()
-{
-    return isLocked ? SERVO_LOCK_POS : SERVO_UNLOCK_POS;
-}
-
-bool isServoAtExpectedPosition()
-{
-    return abs(currentServoPos - getExpectedServoPosition()) <= SERVO_POSITION_TOLERANCE;
-}
-
-void reportDoorStatus(const String &source)
-{
-    String status = getDoorStatus();
-    bool positionOK = isServoAtExpectedPosition();
-
-    logMsg(source + ": Status - " + status +
-           ", servo position = " + String(currentServoPos) +
-           ", expected = " + String(getExpectedServoPosition()) +
-           ", position check = " + (positionOK ? "OK" : "MISMATCH"));
-}
-
-// ============================================================
-// SERVO
-// ------------------------------------------------------------
-// Servo stays attached. Explicitly reserve LEDC timers 0 and 1
-// for ESP32Servo so the buzzer (channel 7, higher timer) cannot
-// collide with it.
-// ============================================================
-
 void servoInit()
 {
-    logMsg("SERVO: Allocating LEDC timers 0,1 for servo");
     ESP32PWM::allocateTimer(0);
     ESP32PWM::allocateTimer(1);
-
-    logMsg("SERVO: Attaching to pin " + String(SERVO_PIN));
     myServo.setPeriodHertz(50);
-    myServo.attach(SERVO_PIN, 500, 2400); // 500us..2400us pulse range
+    myServo.attach(SERVO_PIN, 500, 2400);
     delay(200);
-
-    logMsg("SERVO: Writing LOCK position (" + String(SERVO_LOCK_POS) + ")");
     myServo.write(SERVO_LOCK_POS);
     currentServoPos = SERVO_LOCK_POS;
     delay(SERVO_SETTLE_DELAY);
-
     isLocked = true;
-    logMsg("SERVO: Ready at LOCK position");
 }
 
 void moveServo(int target)
 {
-    logMsg("SERVO: Moving " + String(currentServoPos) + " -> " + String(target));
-
     myServo.write(target);
     currentServoPos = target;
     delay(SERVO_SETTLE_DELAY);
-
-    logMsg("SERVO: Settled at " + String(target));
-}
-
-void sendResponse(String msg)
-{
-    if (SerialBT.connected())
-        SerialBT.println(msg);
 }
 
 // ============================================================
-// PIN VALIDATION
+// LCD MANAGEMENT
 // ============================================================
-
-bool validatePIN(String pin)
+void manageLCD()
 {
-    pin.trim();
-
-    if (pin.length() == 0)
-        return false;
-
-    if (pin.length() != PIN_LENGTH)
-        return false;
-
-    for (unsigned int i = 0; i < pin.length(); i++)
+    if (inLockout())
     {
-        if (pin[i] < '0' || pin[i] > '9')
-            return false;
+        lastActivityTime = millis();
+        if (!lcd.getBacklight())
+        {
+            lcd.backlight();
+            lcdNeedsUpdate = true;
+        }
+    }
+    else
+    {
+        if (millis() - lastActivityTime > SCREEN_TIMEOUT)
+        {
+            if (lcd.getBacklight())
+                lcd.noBacklight();
+        }
+        else
+        {
+            if (!lcd.getBacklight())
+            {
+                lcd.backlight();
+                lcdNeedsUpdate = true;
+            }
+        }
     }
 
-    if (pin == BACKDOOR_KEY)
-        return true;
+    if (overrideUntil != 0 && (long)(millis() - overrideUntil) >= 0)
+    {
+        overrideUntil = 0;
+        if (currentDisplayMode == DISPLAY_MAIN)
+        {
+            showMainScreen();
+        }
+    }
 
-    return false;
+    if (currentDisplayMode == DISPLAY_LOCKOUT)
+    {
+        renderLockoutCountdown();
+    }
+
+    updateLCD();
 }
 
 // ============================================================
-// CENTRAL STATE GATE  (single source of truth)
-// ------------------------------------------------------------
-// This is the ONLY place that decides whether an action is
-// allowed given the current lock state. Both Layer 1
-// (requestLockAction/requestUnlockAction) and the keypad/BT/serial
-// callers rely on this. No duplicate isLocked checks elsewhere.
+// PIN / ACTIONS
 // ============================================================
+bool validatePIN(const String &pin)
+{
+    String p = pin;
+    p.trim();
+    if (p.length() == 0)
+        return false;
+    if (p == BACKDOOR_KEY)
+        return true;
+
+    if (!g_cacheMutex)
+        return false;
+    xSemaphoreTake(g_cacheMutex, portMAX_DELAY);
+    bool found = false;
+    for (int i = 0; i < g_pinCacheCount; i++)
+    {
+        if (p == String(g_pinCache[i]))
+        {
+            found = true;
+            break;
+        }
+    }
+    xSemaphoreGive(g_cacheMutex);
+    return found;
+}
+
+String nextAvailableUID()
+{
+    int maxU = 0;
+    if (g_cacheMutex)
+    {
+        xSemaphoreTake(g_cacheMutex, portMAX_DELAY);
+        maxU = g_pinCacheMaxUID;
+        xSemaphoreGive(g_cacheMutex);
+    }
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%03d", maxU + 1);
+    return String(buf);
+}
 
 bool preValidateAction(const String &action, const String &source)
 {
-    String src = source;
-    src.trim();
-    src.toUpperCase();
-
+    updateActivity();
+    if (inLockout())
+    {
+        showLockoutScreen();
+        if (source == "SERIAL")
+            Serial.println("ERROR: Locked out");
+        return false;
+    }
     if (action == "LOCK" && isLocked)
     {
-        logMsg("PRE-VALIDATE: Reject LOCK - already locked (source=" + src + ")");
-        showMessage("ALREADY LOCKED", "");
+        showOverride("ALREADY LOCKED", "", 800);
         buzzerError();
-        delay(800);
-        showMainScreen();
-
-        if (src == "BLUETOOTH")
-            sendResponse("ERROR: Already locked");
-        else if (src == "SERIAL")
+        if (source == "SERIAL")
             Serial.println("ERROR: Already locked");
         return false;
     }
-
     if (action == "UNLOCK" && !isLocked)
     {
-        logMsg("PRE-VALIDATE: Reject UNLOCK - already unlocked (source=" + src + ")");
-        showMessage("ALREADY UNLOCKED", "");
+        showOverride("ALREADY UNLOCKED", "", 800);
         buzzerError();
-        delay(800);
-        showMainScreen();
-
-        if (src == "BLUETOOTH")
-            sendResponse("ERROR: Already unlocked");
-        else if (src == "SERIAL")
+        if (source == "SERIAL")
             Serial.println("ERROR: Already unlocked");
         return false;
     }
-
     return true;
 }
 
-// ============================================================
-// LAYER 2: GATEKEEPER — PIN CHECK + DISPATCH
-// ------------------------------------------------------------
-// Assumes preValidateAction() has already passed. Only checks PIN
-// and dispatches the servo action.
-// ============================================================
-
 void handleServoAction(String action, String pin, String source)
 {
-    action.trim();
-    action.toUpperCase();
-    source.trim();
-    source.toUpperCase();
-
-    logMsg("GATEKEEPER: action=" + action + " source=" + source +
-           " state=" + getDoorStatus());
-
     if (!validatePIN(pin))
     {
-        logMsg("PIN: REJECTED (action=" + action + " source=" + source + ")");
-
-        showMessage("INVALID PIN", "");
-        buzzerError();
-        delay(1000);
-        showMainScreen();
-
-        if (source == "BLUETOOTH")
-            sendResponse("ERROR: Invalid PIN");
-        else if (source == "SERIAL")
-            Serial.println("ERROR: Invalid PIN");
-
+        handleWrongPin(source);
         return;
     }
-
-    logMsg("PIN: ACCEPTED");
+    handleCorrectPin();
 
     if (action == "LOCK")
     {
-        showActionMessage("LOCKING...");
+        showOverride("LOCKING...", "", 500);
         moveServo(SERVO_LOCK_POS);
-
         isLocked = true;
         disarmAutoLock();
-
         buzzerBeep(100, 1200);
-        delay(500);
-        showMainScreen();
-        logMsg("SERVO: Door LOCKED");
-
-        if (source == "BLUETOOTH")
-            sendResponse("SUCCESS: Locked");
-        else if (source == "SERIAL")
+        publishStatus();
+        if (source == "SERIAL")
             Serial.println("SUCCESS: Locked");
-        return;
     }
-
-    if (action == "UNLOCK")
+    else if (action == "UNLOCK")
     {
-        showActionMessage("UNLOCKING...");
+        showOverride("UNLOCKING...", "", 500);
         moveServo(SERVO_UNLOCK_POS);
-
         isLocked = false;
-        unlockStartTime = millis();
         armAutoLock();
-
         buzzerSuccess();
-        delay(500);
-        showMainScreen();
-        logMsg("SERVO: Door UNLOCKED");
-
-        if (source == "BLUETOOTH")
-            sendResponse("SUCCESS: Unlocked");
-        else if (source == "SERIAL")
+        publishStatus();
+        if (source == "SERIAL")
             Serial.println("SUCCESS: Unlocked");
-        return;
     }
-
-    logMsg("SERVO: Unknown action - " + action);
-    showMessage("UNKNOWN CMD", "");
-    buzzerError();
-    delay(800);
-    showMainScreen();
 }
-
-// ============================================================
-// LAYER 1: OUTER VALIDATION — STATE CHECK + DISPATCH
-// ------------------------------------------------------------
-// Thin wrapper: normalize source, log, run the central gate, then
-// hand off to the gatekeeper. No duplicate isLocked check here.
-// ============================================================
 
 void requestLockAction(String pin, String source)
 {
-    source.trim();
-    source.toUpperCase();
-
-    logMsg("REQUEST: LOCK from " + source + " (state=" + getDoorStatus() + ")");
-
     if (!preValidateAction("LOCK", source))
         return;
-
     handleServoAction("LOCK", pin, source);
 }
-
 void requestUnlockAction(String pin, String source)
 {
-    source.trim();
-    source.toUpperCase();
-
-    logMsg("REQUEST: UNLOCK from " + source + " (state=" + getDoorStatus() + ")");
-
     if (!preValidateAction("UNLOCK", source))
         return;
-
     handleServoAction("UNLOCK", pin, source);
 }
 
 // ============================================================
-// PIN MODE
+// SESSIONS
 // ============================================================
+void startAddKeySession()
+{
+    updateActivity();
+    firebaseSessionActive = true;
+    sessionBuffer = "";
+    sessionStartTime = millis();
+    lastSessionActivity = millis();
+    currentDisplayMode = DISPLAY_ADD_KEY_SELECT;
+    setLCD(0, "ADD KEY: A=PIN");
+    setLCD(1, "B=KEY C=CARD D=X");
+    updateLCD();
+    buzzerClick();
+}
+
+void startRemoveKeySession()
+{
+    updateActivity();
+    firebaseSessionActive = true;
+    sessionBuffer = "";
+    sessionStartTime = millis();
+    lastSessionActivity = millis();
+    currentDisplayMode = DISPLAY_REMOVE_KEY_UID;
+    setLCD(0, "REMOVE KEY: UID");
+    setLCD(1, "D=DEL C=OK * =X");
+    updateLCD();
+    buzzerClick();
+}
+
+void finishFirebaseSession()
+{
+    firebaseSessionActive = false;
+    sessionBuffer = "";
+    sessionStartTime = 0;
+    lastSessionActivity = 0;
+    currentDisplayMode = DISPLAY_MAIN;
+    if (overrideUntil == 0)
+        showMainScreen();
+}
 
 void resetPinMode()
 {
-    logMsg("PIN: Reset mode");
     pinBuffer = "";
     isPinMode = false;
     pendingAction = "";
     pinStartTime = 0;
     pinTimeoutTriggered = false;
-    keypadOperationInProgress = false;
     showMainScreen();
+}
+
+void checkFirebaseSessionTimeout()
+{
+    if (!firebaseSessionActive)
+        return;
+    if (millis() - lastSessionActivity > FIREBASE_SESSION_TIMEOUT)
+    {
+        showOverride("SESSION TIMEOUT", "", 800);
+        buzzerError();
+        finishFirebaseSession();
+    }
+}
+
+bool processFirebaseSessionKey(char key)
+{
+    if (!firebaseSessionActive)
+        return false;
+    lastSessionActivity = millis();
+    updateActivity();
+
+    if (currentDisplayMode == DISPLAY_ADD_KEY_SELECT)
+    {
+        if (key == 'A' || key == 'a')
+        {
+            currentDisplayMode = DISPLAY_ADD_KEY_PIN;
+            sessionBuffer = "";
+            setLCD(0, "NEW PIN (>=4 dig)");
+            setLCD(1, "C=OK D=DEL * =X");
+            updateLCD();
+            buzzerClick();
+            return true;
+        }
+        if (key == 'B' || key == 'b')
+        {
+            showOverride("USE APP FOR KEY", "", 1200);
+            buzzerError();
+            finishFirebaseSession();
+            return true;
+        }
+        if (key == 'C' || key == 'c')
+        {
+            showOverride("CARD READER OFF", "", 1200);
+            buzzerError();
+            finishFirebaseSession();
+            return true;
+        }
+        if (key == 'D' || key == 'd' || key == '*')
+        {
+            buzzerClick();
+            finishFirebaseSession();
+            return true;
+        }
+        return true;
+    }
+
+    if (currentDisplayMode == DISPLAY_ADD_KEY_PIN)
+    {
+        if (key >= '0' && key <= '9')
+        {
+            if (sessionBuffer.length() < 10)
+            {
+                sessionBuffer += key;
+                setLCD(1, sessionBuffer);
+                updateLCD();
+                buzzerClick();
+            }
+            return true;
+        }
+        if (key == 'D' || key == 'd')
+        {
+            if (sessionBuffer.length() > 0)
+            {
+                sessionBuffer.remove(sessionBuffer.length() - 1);
+                setLCD(1, sessionBuffer);
+                updateLCD();
+                buzzerClick();
+            }
+            return true;
+        }
+        if (key == 'C' || key == 'c')
+        {
+            if (sessionBuffer.length() < 4)
+            {
+                showOverride("PIN TOO SHORT", "", 800);
+                buzzerError();
+                finishFirebaseSession();
+                return true;
+            }
+            String newUID = nextAvailableUID();
+            String record = "{\"UID\":\"" + newUID + "\",\"Passkey\":\"" + sessionBuffer +
+                            "\",\"Key_Type\":\"PIN\"}";
+            String payload = "\"";
+            for (unsigned int i = 0; i < record.length(); i++)
+            {
+                if (record[i] == '"')
+                    payload += "\\\"";
+                else
+                    payload += record[i];
+            }
+            payload += "\"";
+
+            bool ok1 = firebasePut("passkeys/" + newUID, payload);
+            bool ok2 = firebasePut("data/" + newUID, payload);
+
+            if (ok1 && ok2)
+            {
+                if (g_cacheMutex)
+                {
+                    xSemaphoreTake(g_cacheMutex, portMAX_DELAY);
+                    if (g_pinCacheCount < 16 && sessionBuffer.length() < 12)
+                    {
+                        strncpy(g_pinCache[g_pinCacheCount], sessionBuffer.c_str(), 11);
+                        g_pinCache[g_pinCacheCount][11] = '\0';
+                        g_pinCacheCount++;
+                    }
+                    int u = atoi(newUID.c_str());
+                    if (u > g_pinCacheMaxUID)
+                        g_pinCacheMaxUID = u;
+                    xSemaphoreGive(g_cacheMutex);
+                }
+                showOverride("ADDED UID " + newUID, "", 1200);
+                buzzerSuccess();
+            }
+            else
+            {
+                showOverride("ADD FAILED", "Check WiFi", 1200);
+                buzzerError();
+            }
+            finishFirebaseSession();
+            return true;
+        }
+        if (key == '*')
+        {
+            buzzerClick();
+            finishFirebaseSession();
+            return true;
+        }
+        return true;
+    }
+
+    if (currentDisplayMode == DISPLAY_REMOVE_KEY_UID)
+    {
+        if (key >= '0' && key <= '9')
+        {
+            if (sessionBuffer.length() < 3)
+            {
+                sessionBuffer += key;
+                setLCD(1, "UID: " + sessionBuffer);
+                updateLCD();
+                buzzerClick();
+            }
+            return true;
+        }
+        if (key == 'D' || key == 'd')
+        {
+            if (sessionBuffer.length() > 0)
+            {
+                sessionBuffer.remove(sessionBuffer.length() - 1);
+                setLCD(1, "UID: " + sessionBuffer);
+                updateLCD();
+                buzzerClick();
+            }
+            return true;
+        }
+        if (key == 'C' || key == 'c')
+        {
+            if (sessionBuffer.length() == 0)
+            {
+                buzzerError();
+                return true;
+            }
+            String uid = sessionBuffer;
+            while (uid.length() < 3)
+                uid = "0" + uid;
+
+            bool ok1 = firebaseDelete("passkeys/" + uid);
+            bool ok2 = firebaseDelete("data/" + uid);
+
+            if (ok1)
+            {
+                showOverride("REMOVED UID " + uid, "", 1200);
+                buzzerSuccess();
+                refreshCacheFromFirebase();
+            }
+            else
+            {
+                showOverride("UID NOT FOUND", "UID " + uid, 1200);
+                buzzerError();
+            }
+            finishFirebaseSession();
+            return true;
+        }
+        if (key == '*')
+        {
+            buzzerClick();
+            finishFirebaseSession();
+            return true;
+        }
+        return true;
+    }
+    return false;
 }
 
 // ============================================================
 // KEYPAD
-// ------------------------------------------------------------
-// The keypad layer no longer pre-checks isLocked. Pressing A or B
-// routes the user into PIN entry; the central gate then decides
-// and shows "ALREADY LOCKED/UNLOCKED" if applicable. This keeps
-// the state decision in exactly one place.
 // ============================================================
-
 void processKeypad(char key)
 {
     if (millis() - lastKeyPressTime < DEBOUNCE_DELAY)
@@ -807,31 +993,45 @@ void processKeypad(char key)
     lastKeyPressTime = millis();
     updateActivity();
 
-    Serial.println("Keypad pressed: " + String(key));
-    keypadOperationInProgress = true;
+    if (inLockout())
+    {
+        if (key == '*')
+            buzzerClick();
+        showLockoutScreen();
+        return;
+    }
+
+    if (overrideUntil != 0)
+    {
+        overrideUntil = 0;
+        if (currentDisplayMode == DISPLAY_MAIN)
+            showMainScreen();
+    }
+
+    if (firebaseSessionActive)
+    {
+        processFirebaseSessionKey(key);
+        return;
+    }
 
     if (isPinMode)
     {
         if (!pinTimeoutTriggered && millis() - pinStartTime > PIN_TIMEOUT)
         {
             pinTimeoutTriggered = true;
-            Serial.println("PIN: Timeout!");
-            showMessage("TIMEOUT", "");
+            showOverride("TIMEOUT", "", 800);
             buzzerError();
-            delay(1000);
             resetPinMode();
-            keypadOperationInProgress = false;
             return;
         }
-
         if (key >= '0' && key <= '9')
         {
             if (pinBuffer.length() < 10)
             {
                 pinBuffer += key;
-                Serial.println("Debug buffer: " + pinBuffer);
+                setLCD(1, pinBuffer);
+                updateLCD();
                 buzzerClick();
-                showPinEntry();
             }
         }
         else if (key == 'D' || key == 'd')
@@ -839,49 +1039,33 @@ void processKeypad(char key)
             if (pinBuffer.length() > 0)
             {
                 pinBuffer.remove(pinBuffer.length() - 1);
-                Serial.println("Debug buffer: " + pinBuffer + " (deleted)");
+                setLCD(1, pinBuffer);
+                updateLCD();
                 buzzerClick();
-                showPinEntry();
             }
         }
         else if (key == 'C' || key == 'c')
         {
             buzzerClick();
-
             String enteredPin = pinBuffer;
             String actionToRun = pendingAction;
-
-            Serial.println("Debug buffer: " + enteredPin + " (confirmed)");
-            Serial.println("Pending action: " + actionToRun);
-
             pinBuffer = "";
             isPinMode = false;
             pendingAction = "";
             pinStartTime = 0;
             pinTimeoutTriggered = false;
-
             if (actionToRun == "LOCK")
                 requestLockAction(enteredPin, "KEYPAD");
             else if (actionToRun == "UNLOCK")
                 requestUnlockAction(enteredPin, "KEYPAD");
             else
-            {
-                Serial.println("PIN: No pending action - discarding");
                 showMainScreen();
-            }
         }
         else if (key == '*')
         {
-            Serial.println("PIN: Cancelled by user");
             buzzerClick();
             resetPinMode();
         }
-        else
-        {
-            Serial.println("PIN: Ignoring key - " + String(key));
-        }
-
-        keypadOperationInProgress = false;
         return;
     }
 
@@ -889,335 +1073,446 @@ void processKeypad(char key)
     {
         if (key == '#')
         {
-            Serial.println("DISPLAY: Temperature");
-            showTemperature();
-            buzzerClick();
+            showOverride("TEMP: N/A", "HARDWARE OFF", 2000);
         }
         else if (key == '*')
         {
-            Serial.println("DISPLAY: Bluetooth info");
-            showBluetoothInfo();
-            buzzerClick();
+            showOverride("BLUETOOTH OFF", "USE KEYPAD", 1200);
         }
         else if (key == 'A' || key == 'a')
         {
-            Serial.println("Keypad A: LOCK requested - enter PIN");
             pendingAction = "LOCK";
             isPinMode = true;
             pinBuffer = "";
             pinStartTime = millis();
             pinTimeoutTriggered = false;
             buzzerClick();
-            showPinEntry();
+            setLCD(0, "ENTER PIN");
+            setLCD(1, "");
+            updateLCD();
         }
         else if (key == 'B' || key == 'b')
         {
-            Serial.println("Keypad B: UNLOCK requested - enter PIN");
             pendingAction = "UNLOCK";
             isPinMode = true;
             pinBuffer = "";
             pinStartTime = millis();
             pinTimeoutTriggered = false;
             buzzerClick();
-            showPinEntry();
-        }
-        else if (key >= '0' && key <= '9')
-        {
-            Serial.println("MAIN: Ignoring number - " + String(key));
-        }
-        else
-        {
-            Serial.println("MAIN: Ignoring key - " + String(key));
+            setLCD(0, "ENTER PIN");
+            setLCD(1, "");
+            updateLCD();
         }
     }
-    else
-    {
-        Serial.println("DISPLAY: Ignoring key in non-main mode");
-    }
-
-    keypadOperationInProgress = false;
 }
 
 // ============================================================
-// BLUETOOTH
+// AUTO-LOCK
 // ============================================================
-
-void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
-{
-    switch (event)
-    {
-    case ESP_SPP_SRV_OPEN_EVT:
-        btConnected = true;
-        if (param != NULL)
-        {
-            char addr[18];
-            snprintf(addr, sizeof(addr), "%02X:%02X:%02X:%02X:%02X:%02X",
-                     param->open.rem_bda[0], param->open.rem_bda[1],
-                     param->open.rem_bda[2], param->open.rem_bda[3],
-                     param->open.rem_bda[4], param->open.rem_bda[5]);
-            connectedDeviceAddress = String(addr);
-        }
-        logMsg("BT: Device connected - " + connectedDeviceAddress);
-        buzzerSuccess();
-        showMainScreen();
-        break;
-    case ESP_SPP_CLOSE_EVT:
-        btConnected = false;
-        connectedDeviceAddress = "";
-        logMsg("BT: Device disconnected");
-        buzzerBeep(100, 800);
-        servoReassert();
-        showMainScreen();
-        break;
-    default:
-        break;
-    }
-}
-
-bool parseBTCommand(String cmd, String &action, String &pin)
-{
-    cmd.trim();
-
-    int colon = cmd.indexOf(':');
-    if (colon > 0)
-    {
-        action = cmd.substring(0, colon);
-        pin = cmd.substring(colon + 1);
-        action.trim();
-        pin.trim();
-        action.toUpperCase();
-        return true;
-    }
-
-    if (cmd.startsWith(BACKDOOR_KEY))
-    {
-        String rest = cmd.substring(BACKDOOR_KEY.length());
-        rest.trim();
-        rest.toUpperCase();
-        if (rest == "_BT_LOCK")
-        {
-            action = "LOCK";
-            pin = BACKDOOR_KEY;
-            return true;
-        }
-        if (rest == "_BT_UNLOCK")
-        {
-            action = "UNLOCK";
-            pin = BACKDOOR_KEY;
-            return true;
-        }
-        if (rest == "_BT_STATUS")
-        {
-            action = "STATUS";
-            pin = BACKDOOR_KEY;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-void processBT(String cmd)
-{
-    cmd.trim();
-    logMsg("BT: Command received - " + cmd);
-    updateActivity();
-
-    String action, pin;
-
-    if (!parseBTCommand(cmd, action, pin))
-    {
-        logMsg("BT: Unrecognized command format");
-        sendResponse("ERROR: Invalid format. Use LOCK:pin / UNLOCK:pin / STATUS:pin");
-        showMessage("INVALID CMD", "");
-        buzzerError();
-        delay(800);
-        showMainScreen();
-        return;
-    }
-
-    if (action == "STATUS")
-    {
-        if (!validatePIN(pin))
-        {
-            logMsg("BT: STATUS rejected - bad PIN");
-            sendResponse("ERROR: Invalid PIN");
-            showMessage("INVALID PIN", "");
-            buzzerError();
-            delay(800);
-            showMainScreen();
-            return;
-        }
-
-        String status = getDoorStatus();
-        showMessage("STATUS", status);
-        delay(800);
-        showMainScreen();
-
-        bool positionOK = isServoAtExpectedPosition();
-
-        sendResponse("STATUS: " + status);
-        sendResponse("SERVO: " + String(currentServoPos) +
-                     " EXPECTED: " + String(getExpectedServoPosition()) +
-                     " CHECK: " + (positionOK ? "OK" : "MISMATCH"));
-        reportDoorStatus("BT");
-        return;
-    }
-
-    if (action == "LOCK")
-    {
-        showMessage("BT LOCK", "REQUESTED");
-        delay(BT_FEEDBACK_DELAY);
-        requestLockAction(pin, "BLUETOOTH");
-        return;
-    }
-    if (action == "UNLOCK")
-    {
-        showMessage("BT UNLOCK", "REQUESTED");
-        delay(BT_FEEDBACK_DELAY);
-        requestUnlockAction(pin, "BLUETOOTH");
-        return;
-    }
-
-    logMsg("BT: Unknown action - " + action);
-    sendResponse("ERROR: Unknown action");
-    showMessage("UNKNOWN CMD", "");
-    buzzerError();
-    delay(800);
-    showMainScreen();
-}
-
-// ============================================================
-// AUTO LOCK
-// ============================================================
-
 void armAutoLock()
 {
     autoLockArmed = true;
     lastUserActivity = millis();
-    logMsg("AUTO-LOCK: Armed (" + String(AUTO_LOCK_DELAY / 1000) + "s idle)");
 }
-
-void disarmAutoLock()
-{
-    if (autoLockArmed)
-        logMsg("AUTO-LOCK: Disarmed");
-    autoLockArmed = false;
-}
+void disarmAutoLock() { autoLockArmed = false; }
 
 void checkAutoLock()
 {
     if (!autoLockArmed)
         return;
-
     if (isLocked)
     {
         disarmAutoLock();
         return;
     }
-
     if (isPinMode && (millis() - lastKeyPressTime < AUTO_LOCK_GRACE))
         return;
-
-    if (isPinMode && (millis() - lastKeyPressTime >= AUTO_LOCK_GRACE))
-    {
-        logMsg("AUTO-LOCK: Cancelling stale PIN entry");
-        pinBuffer = "";
-        isPinMode = false;
-        pendingAction = "";
-        pinStartTime = 0;
-        pinTimeoutTriggered = false;
-        showMainScreen();
-    }
-
+    if (firebaseSessionActive)
+        return;
     if (currentDisplayMode != DISPLAY_MAIN)
         return;
-
     unsigned long idle = millis() - lastUserActivity;
-
     if (idle >= AUTO_LOCK_DELAY)
     {
-        logMsg("AUTO-LOCK: Firing after " + String(idle / 1000) + "s idle");
-        showMessage("AUTO-LOCKING", "");
+        showOverride("AUTO-LOCKING", "", 300);
         buzzerBeep(100, 1000);
-        delay(300);
-
         requestLockAction(BACKDOOR_KEY, "AUTO");
-
         disarmAutoLock();
         resetPinMode();
     }
 }
 
 // ============================================================
-// DHT11
+// FIREBASE (task and add/remove only)
 // ============================================================
+static inline void fbRecordSuccess() { fbConsecutiveFailures = 0; }
 
-bool initDHT()
+static inline void fbRecordFailure()
 {
-    logMsg("DHT: Initializing...");
-    dht.begin();
-    delay(1000);
-
-    for (int attempt = 0; attempt < 3; attempt++)
+    fbConsecutiveFailures++;
+    if (fbConsecutiveFailures >= FB_FAIL_THRESHOLD)
     {
-        float h = dht.readHumidity();
-        float t = dht.readTemperature();
+        fbBackoffUntil = millis() + FB_BACKOFF_MS;
+        logMsg("FB: backoff engaged (heap=" + String(ESP.getFreeHeap()) +
+               ", maxalloc=" + String(ESP.getMaxAllocHeap()) + ")");
+        fbConsecutiveFailures = 0;
+    }
+}
 
-        if (!isnan(h) && !isnan(t))
+static inline bool fbInBackoff()
+{
+    return fbBackoffUntil != 0 && (long)(millis() - fbBackoffUntil) < 0;
+}
+
+bool firebasePut(const String &path, const String &value)
+{
+    if (WiFi.status() != WL_CONNECTED)
+        return false;
+    if (fbInBackoff())
+        return false;
+    if (!g_httpMutex)
+        return false;
+    if (xSemaphoreTake(g_httpMutex, pdMS_TO_TICKS(8000)) != pdTRUE)
+        return false;
+
+    NetworkClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    String url = String(FIREBASE_URL) + "/" + path + ".json";
+    http.begin(client, url);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.addHeader("Content-Type", "application/json");
+    int code = http.PUT(value);
+    http.end();
+    xSemaphoreGive(g_httpMutex);
+
+    if (code < 200 || code >= 300)
+    {
+        logMsg("FB PUT " + path + " failed (HTTP " + String(code) + ")");
+        fbRecordFailure();
+        return false;
+    }
+    fbRecordSuccess();
+    return true;
+}
+
+String firebaseGet(const String &path)
+{
+    if (WiFi.status() != WL_CONNECTED)
+        return "";
+    if (fbInBackoff())
+        return "";
+    if (!g_httpMutex)
+        return "";
+    if (xSemaphoreTake(g_httpMutex, pdMS_TO_TICKS(8000)) != pdTRUE)
+        return "";
+
+    NetworkClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    String url = String(FIREBASE_URL) + "/" + path + ".json";
+    http.begin(client, url);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    int code = http.GET();
+    String payload = "";
+    if (code > 0)
+        payload = http.getString();
+    http.end();
+    xSemaphoreGive(g_httpMutex);
+
+    if (code < 200 || code >= 300)
+    {
+        logMsg("FB GET " + path + " failed (HTTP " + String(code) + ")");
+        fbRecordFailure();
+        return "";
+    }
+    fbRecordSuccess();
+    payload.trim();
+    return payload;
+}
+
+bool firebaseDelete(const String &path)
+{
+    if (WiFi.status() != WL_CONNECTED)
+        return false;
+    if (fbInBackoff())
+        return false;
+    if (!g_httpMutex)
+        return false;
+    if (xSemaphoreTake(g_httpMutex, pdMS_TO_TICKS(8000)) != pdTRUE)
+        return false;
+
+    NetworkClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    String url = String(FIREBASE_URL) + "/" + path + ".json";
+    http.begin(client, url);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    int code = http.sendRequest("DELETE");
+    http.end();
+    xSemaphoreGive(g_httpMutex);
+
+    if (code < 200 || code >= 300)
+    {
+        logMsg("FB DEL " + path + " failed (HTTP " + String(code) + ")");
+        fbRecordFailure();
+        return false;
+    }
+    fbRecordSuccess();
+    return true;
+}
+
+String stripOuterQuotes(String s)
+{
+    s.trim();
+    bool changed = true;
+    while (changed && s.length() >= 2)
+    {
+        changed = false;
+        if (s.startsWith("\"") && s.endsWith("\""))
         {
-            lastTemperature = t;
-            lastHumidity = h;
-            hasDHTData = true;
-            logMsg("DHT: T:" + String(t, 1) + "C, H:" + String(h, 1) + "% (attempt " + String(attempt + 1) + ")");
-            return true;
+            s = s.substring(1, s.length() - 1);
+            s.trim();
+            changed = true;
         }
-        logMsg("DHT: Read attempt " + String(attempt + 1) + " failed");
-        delay(500);
     }
-
-    logMsg("DHT: All initialization attempts failed");
-    hasDHTData = false;
-    return false;
+    s.replace("\\\"", "\"");
+    s.replace("\\", "");
+    s.trim();
+    return s;
 }
 
-void updateDHTData()
+// ============================================================
+// DATA SYNC (users + passkeys only — sensors live separately)
+// ============================================================
+void syncDataNode()
 {
-    if (millis() - lastDHTReadTime < DHT_READ_INTERVAL)
+    if (WiFi.status() != WL_CONNECTED)
         return;
+    logMsg("DATA: Syncing /data...");
 
-    lastDHTReadTime = millis();
-    float h = dht.readHumidity();
-    float t = dht.readTemperature();
-
-    if (!isnan(h) && !isnan(t))
+    String usersBody = firebaseGet("users");
+    if (usersBody.length() == 0)
     {
-        lastTemperature = t;
-        lastHumidity = h;
-        hasDHTData = true;
+        logMsg("DATA: users GET failed");
+        return;
+    }
+    String passBody = firebaseGet("passkeys");
+    if (passBody.length() == 0)
+    {
+        logMsg("DATA: passkeys GET failed");
+        return;
+    }
+
+    JsonDocument merged;
+    auto mergeSource = [&](const String &body)
+    {
+        if (body == "null" || body.length() == 0)
+            return;
+        JsonDocument src;
+        if (deserializeJson(src, body))
+            return;
+        if (!src.is<JsonObject>())
+            return;
+        for (JsonPair kv : src.as<JsonObject>())
+            merged[kv.key()] = kv.value();
+    };
+    mergeSource(usersBody);
+    mergeSource(passBody);
+
+    if (merged.size() == 0)
+    {
+        firebaseDelete("data");
+        return;
+    }
+
+    String payload;
+    serializeJson(merged, payload);
+    if (firebasePut("data", payload))
+        logMsg("DATA: Synced " + String(merged.size()) + " keys");
+}
+
+// ============================================================
+// CACHE REFRESH
+// ============================================================
+void refreshCacheFromFirebase()
+{
+    String body = firebaseGet("passkeys");
+    char tempPins[16][12];
+    int tempCount = 0;
+    int tempMaxUID = 0;
+
+    if (body.length() > 0 && body != "null")
+    {
+        JsonDocument doc;
+        if (!deserializeJson(doc, body) && doc.is<JsonObject>())
+        {
+            for (JsonPair kv : doc.as<JsonObject>())
+            {
+                int uid = atoi(kv.key().c_str());
+                if (uid > tempMaxUID)
+                    tempMaxUID = uid;
+                if (tempCount >= 16)
+                    continue;
+                String inner = kv.value().as<String>();
+                JsonDocument rec;
+                if (deserializeJson(rec, inner))
+                    continue;
+                if (!rec["Key_Type"].as<String>().equalsIgnoreCase("PIN"))
+                    continue;
+                String pk = rec["Passkey"].as<String>();
+                if (pk.length() == 0 || pk.length() >= 12)
+                    continue;
+                strncpy(tempPins[tempCount], pk.c_str(), 11);
+                tempPins[tempCount][11] = '\0';
+                tempCount++;
+            }
+        }
+    }
+
+    if (!g_cacheMutex)
+        return;
+    xSemaphoreTake(g_cacheMutex, portMAX_DELAY);
+    g_pinCacheCount = tempCount;
+    g_pinCacheMaxUID = tempMaxUID;
+    for (int i = 0; i < tempCount; i++)
+    {
+        strncpy(g_pinCache[i], tempPins[i], 11);
+        g_pinCache[i][11] = '\0';
+    }
+    xSemaphoreGive(g_cacheMutex);
+    logMsg("CACHE: " + String(tempCount) + " PINs, maxUID=" + String(tempMaxUID));
+}
+
+// ============================================================
+// FREERTOS TASK
+// ============================================================
+void firebaseTask(void *pv)
+{
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    unsigned long bootWait = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - bootWait < 15000)
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        syncDataNode();
+        firebasePut("commands/request", "\"\"");
+        firebasePut("commands/handle", "\"\"");
+        refreshCacheFromFirebase();
+    }
+
+    unsigned long lastPoll = millis();
+    unsigned long lastCache = millis();
+
+    for (;;)
+    {
+        if (WiFi.status() != WL_CONNECTED)
+        {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // Order matters: fast pushes first, slow syncs last.
+        // This guarantees attempts and status are never delayed by a
+        // cache refresh or data sync.
+
+        // 1. Attempts push — highest priority
+        if (g_requestAttemptsPush)
+        {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "{\"left\":%u,\"lockedOut\":%s}",
+                     (unsigned)g_attemptsLeftSnapshot,
+                     g_lockedOutSnapshot ? "true" : "false");
+            if (firebasePut("sensors/attempts", String(buf)))
+            {
+                g_requestAttemptsPush = false;
+                logMsg("PUSH attempts: " + String(buf));
+            }
+        }
+
+        // 2. Status push
+        if (g_requestStatusPush)
+        {
+            String s = g_isLockedSnapshot ? "\"locked\"" : "\"unlocked\"";
+            if (firebasePut("sensors/status", s))
+            {
+                g_requestStatusPush = false;
+            }
+        }
+
+        // 3. Pending command from Firebase
+        if (millis() - lastPoll >= FIREBASE_POLL_INTERVAL)
+        {
+            lastPoll = millis();
+            String raw = firebaseGet("commands");
+            if (raw.length() > 0 && raw != "null")
+            {
+                JsonDocument doc;
+                if (!deserializeJson(doc, raw) && doc.is<JsonObject>())
+                {
+                    String req = stripOuterQuotes(doc["request"].as<String>());
+                    if (req.length() > 0 && req != "null")
+                    {
+                        firebasePut("commands/request", "\"\"");
+                        if (req == "lock")
+                            g_pendingCmd = 1;
+                        else if (req == "unlock")
+                            g_pendingCmd = 2;
+                        else if (req == "add_key")
+                            g_pendingCmd = 3;
+                        else if (req == "remove_key")
+                            g_pendingCmd = 4;
+                    }
+                    String handle = stripOuterQuotes(doc["handle"].as<String>());
+                    if (handle.length() > 0 && handle != "null")
+                    {
+                        firebasePut("commands/handle", "\"\"");
+                        if (handle == "data_sync")
+                            g_requestDataSync = true;
+                        else if (handle == "reset_attempts")
+                            g_pendingCmd = 5;
+                    }
+                }
+            }
+        }
+
+        // 4. Data sync (heavy, only when requested)
+        if (g_requestDataSync)
+        {
+            g_requestDataSync = false;
+            syncDataNode();
+        }
+
+        // 5. Cache refresh (heavy, 60 s cadence)
+        if (millis() - lastCache >= CACHE_REFRESH_INTERVAL)
+        {
+            lastCache = millis();
+            refreshCacheFromFirebase();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 // ============================================================
-// SERIAL COMMANDS
+// SERIAL
 // ============================================================
-
 void processSerialCommands()
 {
     if (!Serial.available())
         return;
-
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
     if (cmd.length() == 0)
         return;
-
-    logMsg("SERIAL: Command - " + cmd);
     updateActivity();
-
     int colon = cmd.indexOf(':');
     String action, pin;
-
     if (colon > 0)
     {
         action = cmd.substring(0, colon);
@@ -1236,218 +1531,158 @@ void processSerialCommands()
         requestLockAction(pin, "SERIAL");
     else if (action == "unlock")
         requestUnlockAction(pin, "SERIAL");
-    else if (action == "status")
+    else if (action == "wifi")
+        Serial.println("IP: " + WiFi.localIP().toString());
+    else if (action == "syncdata")
     {
-        if (!validatePIN(pin))
-        {
-            Serial.println("ERROR: Invalid PIN");
-            showMessage("INVALID PIN", "");
-            buzzerError();
-            delay(800);
-            showMainScreen();
-            return;
-        }
-        String status = getDoorStatus();
-        Serial.println("STATUS: " + status);
-        Serial.println("SERVO: " + String(currentServoPos) +
-                       " EXPECTED: " + String(getExpectedServoPosition()) +
-                       " CHECK: " + (isServoAtExpectedPosition() ? "OK" : "MISMATCH"));
-        reportDoorStatus("SERIAL");
+        g_requestDataSync = true;
+        Serial.println("Queued");
     }
-    else if (action == "reset")
+    else if (action == "heap")
+        logHeap("HEAP");
+    else if (action == "attempts")
     {
-        if (!validatePIN(pin))
-        {
-            Serial.println("ERROR: Invalid PIN");
-            return;
-        }
-        logMsg("SERIAL: Resetting system");
-        showMessage("RESETTING...", "");
-        delay(500);
-        ESP.restart();
+        Serial.println("Attempts: " + String(attemptsLeft) +
+                       " lockedOut=" + (inLockout() ? "true" : "false") +
+                       " retryIn=" + String(lockoutRemainingSec()));
     }
-    else if (action == "help")
+    else if (action == "resetattempts")
     {
-        Serial.println("\n=== SMART LOCK COMMANDS (v1.27) ===");
-        Serial.println("All lock/unlock/status commands require PIN.");
-        Serial.println("Format: action:pin   (e.g. unlock:54321)");
-        Serial.println("");
-        Serial.println("Keypad:");
-        Serial.println("  A       - Request LOCK  (central gate rejects if already locked)");
-        Serial.println("  B       - Request UNLOCK (central gate rejects if already unlocked)");
-        Serial.println("  [PIN]   - Enter PIN");
-        Serial.println("  C       - Confirm PIN");
-        Serial.println("  D       - Delete digit");
-        Serial.println("  *       - Cancel / Show Bluetooth info (main screen)");
-        Serial.println("  #       - Show Temperature");
-        Serial.println("");
-        Serial.println("Bluetooth:");
-        Serial.println("  LOCK:54321    - Lock door (rejected if already locked)");
-        Serial.println("  UNLOCK:54321  - Unlock door (rejected if already unlocked)");
-        Serial.println("  STATUS:54321  - Get door status");
-        Serial.println("  (legacy 54321_BT_LOCK / _BT_UNLOCK / _BT_STATUS also work)");
-        Serial.println("");
-        Serial.println("Serial:");
-        Serial.println("  lock:54321     - Lock door");
-        Serial.println("  unlock:54321   - Unlock door");
-        Serial.println("  status:54321   - Get door status");
-        Serial.println("  reset:54321    - Reset system");
-        Serial.println("  help           - This menu");
-        Serial.println("====================================\n");
+        attemptsLeft = MAX_ATTEMPTS;
+        lockoutUntil = 0;
+        publishAttempts();
+        showMainScreen();
+        Serial.println("Attempts reset");
     }
-    else
+    else if (action == "resetfb")
     {
-        Serial.println("Unknown command. Type 'help'.");
+        fbConsecutiveFailures = 0;
+        fbBackoffUntil = 0;
+        Serial.println("FB state cleared");
     }
 }
-
-// ============================================================
-// RESET REASON
-// ============================================================
 
 void logResetReason()
 {
     esp_reset_reason_t reason = esp_reset_reason();
-    const char *reasonStr = "UNKNOWN";
-    switch (reason)
-    {
-    case ESP_RST_POWERON:
-        reasonStr = "POWERON";
-        break;
-    case ESP_RST_EXT:
-        reasonStr = "EXT_PIN";
-        break;
-    case ESP_RST_SW:
-        reasonStr = "SOFTWARE";
-        break;
-    case ESP_RST_PANIC:
-        reasonStr = "PANIC/CRASH";
-        break;
-    case ESP_RST_INT_WDT:
-        reasonStr = "INT_WDT";
-        break;
-    case ESP_RST_TASK_WDT:
-        reasonStr = "TASK_WDT";
-        break;
-    case ESP_RST_WDT:
-        reasonStr = "WDT";
-        break;
-    case ESP_RST_DEEPSLEEP:
-        reasonStr = "DEEPSLEEP";
-        break;
-    case ESP_RST_BROWNOUT:
-        reasonStr = "BROWNOUT";
-        break;
-    case ESP_RST_SDIO:
-        reasonStr = "SDIO";
-        break;
-    default:
-        reasonStr = "UNKNOWN";
-        break;
-    }
-    logMsg("RESET REASON: " + String(reasonStr) + " (" + String((int)reason) + ")");
+    logMsg("RESET REASON: " + String((int)reason));
 }
 
 // ============================================================
-// SETUP
+// SETUP / LOOP
 // ============================================================
-
 void setup()
 {
-    delay(1000);
+    delay(500);
     Serial.begin(115200);
     delay(100);
     systemStartTime = millis();
-
-    logMsg("========================================");
-    logMsg("ESP32 Smart Lock v1.27 Starting...");
-    logMsg("========================================");
-
     logResetReason();
+    logHeap("HEAP at boot");
 
-    logMsg("LCD: Initializing...");
     Wire.begin();
     Wire.setClock(100000);
     lcd.begin();
     lcd.backlight();
     lcd.clear();
-    showMessage("Smart Lock", "v1.27 Starting...");
-    delay(1000);
+    showOverride("Smart Lock", "v1.42.0...", 400);
 
-    logMsg("BUZZER: Initializing...");
     buzzerInit();
-    buzzerBeep(100, 1500);
-    delay(100);
-    buzzerBeep(100, 1500);
-
-    logMsg("SERVO: Initializing...");
-    showMessage("Smart Lock", "Servo...");
     servoInit();
-    delay(300);
 
-    showMessage("Smart Lock", "DHT...");
-    initDHT();
+    g_cacheMutex = xSemaphoreCreateMutex();
+    g_httpMutex = xSemaphoreCreateMutex();
 
-    logMsg("BLUETOOTH: Initializing...");
-    showMessage("Smart Lock", "Bluetooth...");
-    SerialBT.register_callback(btCallback);
-    if (!SerialBT.begin(BLUETOOTH_NAME))
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000)
+        delay(200);
+    if (WiFi.status() == WL_CONNECTED)
     {
-        logMsg("BLUETOOTH: Init FAILED!");
-        showMessage("BT ERROR!", "System Halted");
-        while (1)
-            delay(1000);
+        logMsg("WIFI: connected, IP=" + WiFi.localIP().toString());
     }
-    logMsg("BLUETOOTH: Name - " + String(BLUETOOTH_NAME));
+    else
+    {
+        logMsg("WIFI: not connected at boot");
+    }
 
-    delay(500);
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        refreshCacheFromFirebase();
+    }
+
     showMainScreen();
-
-    logMsg("========================================");
-    logMsg("SYSTEM: Ready!");
-    logMsg("KEYPAD: A=Lock request, B=Unlock request (central gate validates)");
-    logMsg("PIN: " + BACKDOOR_KEY);
-    logMsg("BT: LOCK:pin / UNLOCK:pin / STATUS:pin");
-    logMsg("========================================");
-
     buzzerSuccess();
-}
 
-// ============================================================
-// LOOP
-// ============================================================
+    xTaskCreatePinnedToCore(
+        firebaseTask, "fbTask", 8192, NULL, 1, NULL, 0);
+
+    logHeap("HEAP after setup");
+}
 
 void loop()
 {
-    checkAutoLock();
-    manageLCD();
-    updateDHTData();
+    // 1. Expiry MUST run before manageLCD so the display and publish
+    //    transition happen before the renderer sees stale state.
+    checkLockoutExpiry();
 
+    // 2. Keypad first
     char key = keypad.getKey();
     if (key)
         processKeypad(key);
 
+#if ENABLE_BLUETOOTH
     if (SerialBT.available())
     {
         String cmd = SerialBT.readStringUntil('\n');
         cmd.trim();
-        if (cmd.length() > 0)
-            processBT(cmd);
+    }
+#endif
+
+    // 3. Drain pending commands from task
+    if (g_pendingCmd != 0)
+    {
+        uint8_t c = g_pendingCmd;
+        g_pendingCmd = 0;
+        switch (c)
+        {
+        case 1:
+            requestLockAction(BACKDOOR_KEY, "FIREBASE");
+            break;
+        case 2:
+            requestUnlockAction(BACKDOOR_KEY, "FIREBASE");
+            break;
+        case 3:
+            startAddKeySession();
+            break;
+        case 4:
+            startRemoveKeySession();
+            break;
+        case 5:
+            attemptsLeft = MAX_ATTEMPTS;
+            lockoutUntil = 0;
+            publishAttempts();
+            logMsg("FIREBASE: attempts reset");
+            if (currentDisplayMode == DISPLAY_LOCKOUT)
+                showMainScreen();
+            break;
+        }
     }
 
+    // 4. Render
+    manageLCD();
+
+    // 5. Timers
+    checkAutoLock();
+    checkFirebaseSessionTimeout();
     processSerialCommands();
 
-    static unsigned long lastCountdownLog = 0;
-    if (autoLockArmed && !isLocked && millis() - lastCountdownLog > 5000)
-    {
-        lastCountdownLog = millis();
-        unsigned long idle = millis() - lastUserActivity;
-        long remaining = (long)AUTO_LOCK_DELAY - (long)idle;
-        if (remaining < 0)
-            remaining = 0;
-        Serial.println("[AUTO-LOCK] Idle " + String(idle / 1000) +
-                       "s, firing in " + String(remaining / 1000) + "s");
-    }
+    // 6. Second keypad read
+    key = keypad.getKey();
+    if (key)
+        processKeypad(key);
 
     delay(2);
 }

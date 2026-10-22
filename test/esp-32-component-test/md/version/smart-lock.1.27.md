@@ -21,13 +21,11 @@
  *   called from requestLockAction()/requestUnlockAction().
  *   The keypad layer no longer pre-checks isLocked; it just routes
  *   the user into PIN entry, and the central gate decides.
- *
  * - Keypad UX preserved: pressing A while locked still shows
  *   "ALREADY LOCKED" immediately (feedback comes from the central
  *   gate, not a duplicate check).
- *
- * Kept: two-layer validation, reset reason logging, modular structure,
- * configurable timings, BT/serial/keypad parity.
+ * - Kept: two-layer validation, reset reason logging, modular structure,
+ *   configurable timings, BT / serial / keypad parity.
  */
 
 #include "BluetoothSerial.h"
@@ -383,7 +381,7 @@ void manageLCD()
 }
 
 // ============================================================
-// BUZZER  (fixed: dedicated LEDC channel, servo re-assertion)
+// BUZZER (fixed: dedicated LEDC channel, servo re-assertion)
 // ------------------------------------------------------------
 // ESP32Servo uses LEDC timers. ledcWriteTone() on a channel that
 // shares a timer with the servo will change that timer's frequency,
@@ -538,7 +536,7 @@ bool validatePIN(String pin)
 }
 
 // ============================================================
-// CENTRAL STATE GATE  (single source of truth)
+// CENTRAL STATE GATE (single source of truth)
 // ------------------------------------------------------------
 // This is the ONLY place that decides whether an action is
 // allowed given the current lock state. Both Layer 1
@@ -708,7 +706,6 @@ void requestUnlockAction(String pin, String source)
 
 void resetPinMode()
 {
-    logMsg("PIN: Reset mode");
     pinBuffer = "";
     isPinMode = false;
     pendingAction = "";
